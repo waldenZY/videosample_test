@@ -8,6 +8,7 @@ import re
 import threading
 import time
 import uuid
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -20,7 +21,6 @@ from pydantic import BaseModel
 
 from . import media
 from . import algorithms
-from .comparison import compare_runs
 from .download import download_remote_video, is_remote_video_url
 from .preparation import _operation_timing, resolve_operation_video_path
 from .table_dataset import convert_table
@@ -30,10 +30,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNS = Path(os.environ.get("VIDEOSAMPLE_RUNS", str(ROOT / "runs"))).resolve()
 LOCK = threading.RLock()
 POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="frame")
-STAGE_NAMES = {"collected": "最初收集", "timestamps": "合并相近时刻",
-               "range": "确定任务范围", "states": "合并重复页面",
-               "endpoints": "保留任务首尾", "budget": "控制图片数量",
-               "final": "最终结果"}
+VIDEO_LOCKS = {}
 
 
 def run_directory(identity: str) -> Path:
@@ -109,18 +106,6 @@ def list_algorithms():
     return [algorithms.snapshot(key) for key in ("base", "current")]
 
 
-@app.get("/api/compare")
-def comparison(left: str, right: str):
-    if left == right:
-        raise HTTPException(422, "请选择两次不同的运行")
-
-    def saved_trace(identity, index):
-        path = run_directory(identity) / "items" / f"{index:05d}" / "process" / "trace.json"
-        return json.loads(path.read_text(encoding="utf-8"))
-
-    return compare_runs(read_run(left), read_run(right), saved_trace)
-
-
 @app.post("/api/import")
 def import_table(file: UploadFile = File(...)):
     filename = Path((file.filename or "dataset.xlsx").replace("\\", "/")).name
@@ -169,10 +154,14 @@ def list_runs():
     for path in RUNS.glob("*/run.json"):
         try:
             run = read_run(path.parent.name)
+            if run.get("group_id") and run["id"] != run["group_id"]:
+                continue
+            chains = chain_summaries(run)
+            combined_status = "running" if any(c["status"] == "running" for c in chains) else run["status"]
             result.append({key: run[key] for key in ("id", "name", "status", "created_at", "version")}
-                          | {"count": len(run["rows"]),
+                          | {"status": combined_status, "count": sum(c["count"] for c in chains),
                              "algorithm": run.get("algorithm"),
-                             "done": sum(row["status"] == "done" for row in run["rows"])})
+                             "chains": chains, "done": sum(c["done"] for c in chains)})
         except (OSError, ValueError, HTTPException):
             continue
     return sorted(result, key=lambda row: row["created_at"], reverse=True)
@@ -180,21 +169,29 @@ def list_runs():
 
 @app.get("/api/runs/{identity}")
 def get_run(identity: str):
-    return read_run(identity)
+    run = read_run(identity)
+    run["chains"] = chain_summaries(run)
+    return run
+
+
+def chain_summaries(run):
+    result = []
+    for key, identity in run.get("chain_ids", {run.get("algorithm", {}).get("key", "base"): run["id"]}).items():
+        chain = run if identity == run["id"] else read_run(identity)
+        result.append({"key": key, "id": identity, "name": "base · 固定链路" if key == "base" else "实验链路",
+                       "status": chain["status"], "count": len(chain["rows"]),
+                       "done": sum(row["status"] == "done" for row in chain["rows"]),
+                       "failed": sum(row["status"] in {"error", "interrupted"} for row in chain["rows"])})
+    return result
 
 
 class StartRequest(BaseModel):
     indices: list[int] | None = None
     name: str = ""
-    algorithm: str = "base"
 
 
 @app.post("/api/runs/{identity}/start")
 def start(identity: str, request: StartRequest):
-    try:
-        algorithm_snapshot = algorithms.snapshot(request.algorithm)
-    except ValueError as exc:
-        raise HTTPException(422, str(exc)) from exc
     with LOCK:
         run = read_run(identity)
         if run["status"] != "imported":
@@ -207,14 +204,21 @@ def start(identity: str, request: StartRequest):
             row.update(status="queued" if row["index"] in selected else "skipped",
                        message="等待抽帧" if row["index"] in selected else "未勾选")
         run["name"] = request.name.strip() or run["name"]
-        run["algorithm"] = algorithm_snapshot
-        run["version"] = algorithm_snapshot["algorithm_version"]
-        algorithms.save_source(request.algorithm, run_directory(identity))
         run["status"] = "running"
-        save_run(run)
+        experiment_id = uuid.uuid4().hex
+        chain_ids = {"base": identity, "current": experiment_id}
+        run.update(group_id=identity, chain_ids=chain_ids)
+        for key, chain_id in chain_ids.items():
+            chain = deepcopy(run)
+            chain["id"] = chain_id
+            chain["algorithm"] = algorithms.snapshot(key)
+            chain["version"] = chain["algorithm"]["algorithm_version"]
+            save_run(chain)
+            algorithms.save_source(key, run_directory(chain_id))
     for index in indices:
         POOL.submit(process_row, identity, index)
-    return read_run(identity)
+        POOL.submit(process_row, experiment_id, index)
+    return get_run(identity)
 
 
 @app.post("/api/runs/{identity}/copy")
@@ -224,13 +228,30 @@ def copy_run(identity: str):
     run["name"] += " · 重跑"
     run["created_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
     run["status"] = "imported"
+    run.pop("group_id", None)
+    run.pop("chain_ids", None)
     run["rows"] = [{"index": row["index"], "item": row["item"], "status": "ready", "message": "等待开始"}
                    for row in run["rows"]]
-    run["algorithm"] = algorithms.snapshot(run.get("algorithm", {}).get("key", "base"))
+    run["algorithm"] = algorithms.snapshot("base")
     run["version"] = run["algorithm"]["algorithm_version"]
     with LOCK:
         save_run(run)
     return run
+
+
+def prepared_video(run, index, item):
+    """两条链路使用同一份视频；远程视频每题只下载一次。"""
+    if not is_remote_video_url(item["video_path"]):
+        return resolve_operation_video_path(item["video_path"], base_dir=ROOT)
+    group_id = run.get("group_id", run["id"])
+    with LOCK:
+        lock = VIDEO_LOCKS.setdefault((group_id, index), threading.Lock())
+    directory = run_directory(group_id) / "inputs" / f"{index:05d}"
+    with lock:
+        path = directory / "video.mp4"
+        if path.is_file():
+            return path
+        return download_remote_video(item["video_path"], directory)
 
 
 def process_row(identity: str, index: int):
@@ -242,12 +263,9 @@ def process_row(identity: str, index: int):
         run = read_run(identity)
         algorithm = algorithms.implementation(run.get("algorithm", {}).get("key", "base"))
         update_row(identity, index, status="running", message="正在准备视频")
-        raw = item["video_path"]
-        if is_remote_video_url(raw):
+        if is_remote_video_url(item["video_path"]):
             update_row(identity, index, message="正在下载视频")
-            video = download_remote_video(raw, directory / "video")
-        else:
-            video = resolve_operation_video_path(raw, base_dir=ROOT)
+        video = prepared_video(run, index, item)
         (directory / "video_ref.json").write_text(json.dumps({"path": str(video)}, ensure_ascii=False), encoding="utf-8")
         duration = algorithm.probe_duration(video)
         if duration <= 0:
@@ -268,6 +286,7 @@ def process_row(identity: str, index: int):
         metadata = json.loads((directory / "final" / "keyframes.json").read_text(encoding="utf-8"))
         update_row(identity, index, status="done", message="抽帧完成", frame_count=len(frames),
                    effective_config=metadata["config"],
+                   stages=[{"id": stage["id"], "title": stage["title"]} for stage in recorder.stages],
                    stage_counts=counts, elapsed_s=round(time.monotonic() - started, 2))
     except Exception as exc:
         update_row(identity, index, status="error", message="本题失败", error=str(exc),

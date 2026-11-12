@@ -152,7 +152,7 @@ def test_remote_video_download_and_batch_record(tmp_path, monkeypatch, video):
         result = server.read_run(identity)
         assert [row["status"] for row in result["rows"]] == ["done", "error"]
         assert result["rows"][0]["video_sha256"] == hashlib.sha256(payload).hexdigest()
-        assert (tmp_path / "runs" / identity / "items/00000/video/video.mp4").read_bytes() == payload
+        assert (tmp_path / "runs" / identity / "inputs/00000/video.mp4").read_bytes() == payload
         assert "不是视频" in result["rows"][1]["error"]
     finally:
         httpd.shutdown()
@@ -179,7 +179,7 @@ def test_xlsx_batch_api(tmp_path, monkeypatch, video):
         deadline = time.monotonic() + 40
         while time.monotonic() < deadline:
             run = client.get(f"/api/runs/{identity}").json()
-            if run["status"] == "done":
+            if run["status"] == "done" and all(c["status"] == "done" for c in run["chains"]):
                 break
             time.sleep(0.1)
         assert run["status"] == "done", run
@@ -203,7 +203,7 @@ def test_xlsx_batch_api(tmp_path, monkeypatch, video):
         assert recovered["rows"][0]["status"] == "interrupted"
 
 
-def test_base_experiment_and_comparison(tmp_path, monkeypatch, video):
+def test_paired_chains_have_independent_steps(tmp_path, monkeypatch, video):
     monkeypatch.setattr(server, "RUNS", tmp_path / "runs")
 
     class InlinePool:
@@ -211,43 +211,89 @@ def test_base_experiment_and_comparison(tmp_path, monkeypatch, video):
             fn(*args)
 
     monkeypatch.setattr(server, "POOL", InlinePool())
-    called = []
     extract = media.extract_scene_keyframes
 
     def experiment(*args, **kwargs):
-        called.append(True)
-        return extract(*args, **kwargs)
+        frames = extract(*args, **kwargs)
+        recorder = media._PROCESS.get()
+        final = recorder.stages[-1]
+        final["id"], final["title"] = "experiment_custom", "实验自定义步骤"
+        recorder.stages[:] = [final]
+        return frames
 
     monkeypatch.setattr(media, "extract_scene_keyframes", experiment)
-    payload = json.dumps({"id": "same", "query": "比较同一视频", "video_path": str(video),
+    payload = json.dumps({"id": "same", "query": "同一题两条链路", "video_path": str(video),
                           "task_end_time": 13}, ensure_ascii=False).encode("utf-8")
     with TestClient(server.app) as client:
-        assert len(client.get("/api/algorithms").json()) == 2
         base = client.post("/api/import", files={"file": ("input.jsonl", payload)}).json()
         base = client.post(f"/api/runs/{base['id']}/start", json={}).json()
-        assert base["algorithm"]["key"] == "base" and not called
+        assert len(base["chains"]) == 2
+        other_id = base["chain_ids"]["current"]
+        other = client.get(f"/api/runs/{other_id}").json()
+        assert base["rows"][0]["status"] == other["rows"][0]["status"] == "done"
+        assert base["algorithm"]["key"] == "base" and other["algorithm"]["key"] == "current"
+        assert base["rows"][0]["stages"][-1]["id"] == "final"
+        assert other["rows"][0]["stages"] == [{"id": "experiment_custom", "title": "实验自定义步骤"}]
         assert (tmp_path / "runs" / base["id"] / "algorithm.py").is_file()
-        assert base["rows"][0]["effective_config"]["sample_fps"] == 1.0
-        other = client.post(f"/api/runs/{base['id']}/copy").json()
-        assert client.post(f"/api/runs/{other['id']}/start", json={"algorithm": "bad"}).status_code == 422
-        other = client.post(f"/api/runs/{other['id']}/start", json={"algorithm": "current"}).json()
-        assert other["algorithm"]["key"] == "current" and called
-        url = f"/api/compare?left={base['id']}&right={other['id']}"
-        compared = client.get(url).json()
-        row = compared["rows"][0]
-        assert row["comparable"] and not row["notices"]
-        assert len(row["left"]["frames"]) == len(row["right"]["frames"])
-        assert len(row["left"]["stages"]) == 7
-        assert client.get(row["left"]["frames"][0]["image_url"]).status_code == 200
-        assert client.get(f"/api/compare?left={base['id']}&right={base['id']}").status_code == 422
-        other["rows"][0]["video_sha256"] = "changed"
-        server.save_run(other)
-        row = client.get(url).json()["rows"][0]
-        assert not row["comparable"] and any("视频内容不同" in notice for notice in row["notices"])
-        other["rows"][0]["video_sha256"] = base["rows"][0]["video_sha256"]
-        other["rows"][0]["effective_config"]["task_end_time"] = 14
-        server.save_run(other)
-        assert any("时间范围不同" in notice for notice in client.get(url).json()["rows"][0]["notices"])
-        other["rows"] = []
-        server.save_run(other)
-        assert client.get(url).json()["rows"][0]["right"] is None
+        assert (tmp_path / "runs" / other_id / "algorithm.py").is_file()
+        assert len(client.get("/api/runs").json()) == 1
+        assert client.get("/api/compare?left=a&right=b").status_code == 404
+        base_trace = client.get(f"/api/runs/{base['id']}/items/0/trace").json()
+        other_trace = client.get(f"/api/runs/{other_id}/items/0/trace").json()
+        assert len(base_trace["stages"]) == 7 and len(other_trace["stages"]) == 1
+        assert base["rows"][0]["video_sha256"] == other["rows"][0]["video_sha256"]
+        copied = client.post(f"/api/runs/{other_id}/copy").json()
+        assert "chain_ids" not in copied and "group_id" not in copied
+        copied = client.post(f"/api/runs/{copied['id']}/start", json={}).json()
+        assert len(copied["chains"]) == 2 and copied["chain_ids"] != base["chain_ids"]
+
+
+def test_both_chains_start_and_experiment_failure_is_isolated(tmp_path, monkeypatch, video):
+    from concurrent.futures import ThreadPoolExecutor
+    monkeypatch.setattr(server, "RUNS", tmp_path / "runs")
+    pool = ThreadPoolExecutor(max_workers=2)
+    monkeypatch.setattr(server, "POOL", pool)
+    barrier = threading.Barrier(2, timeout=5)
+    original_base = base_media.extract_scene_keyframes
+
+    def base(*args, **kwargs):
+        barrier.wait()
+        return original_base(*args, **kwargs)
+
+    def experiment(*args, **kwargs):
+        barrier.wait()
+        raise ValueError("实验链路测试失败")
+
+    monkeypatch.setattr(base_media, "extract_scene_keyframes", base)
+    monkeypatch.setattr(media, "extract_scene_keyframes", experiment)
+    downloads = []
+
+    def download(url, directory):
+        downloads.append(url)
+        time.sleep(0.03)
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "video.mp4"
+        path.write_bytes(video.read_bytes())
+        return path
+
+    monkeypatch.setattr(server, "download_remote_video", download)
+    payload = json.dumps({"id": "same", "query": "同时运行", "video_path": "https://example.test/video.mp4",
+                          "task_end_time": 13}, ensure_ascii=False).encode("utf-8")
+    try:
+        with TestClient(server.app) as client:
+            run = client.post("/api/import", files={"file": ("input.jsonl", payload)}).json()
+            run = client.post(f"/api/runs/{run['id']}/start", json={}).json()
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                run = client.get(f"/api/runs/{run['id']}").json()
+                if all(c["status"] == "done" for c in run["chains"]):
+                    break
+                time.sleep(0.05)
+            other = client.get(f"/api/runs/{run['chain_ids']['current']}").json()
+            assert run["rows"][0]["status"] == "done"
+            assert other["rows"][0]["status"] == "error"
+            assert "实验链路测试失败" in other["rows"][0]["error"]
+            assert downloads == ["https://example.test/video.mp4"]
+            assert run["rows"][0]["video_sha256"] == other["rows"][0]["video_sha256"]
+    finally:
+        pool.shutdown(wait=True)
