@@ -26,7 +26,7 @@ from pathlib import Path
 import numpy as np
 
 
-KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v2"
+KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v3"
 DEFAULT_TASK_START_TIME = 7.0
 
 # 仅供实验台记录过程；不参与任何选帧决策。定稿迁回时可整体移除。
@@ -197,6 +197,10 @@ class KeyframeConfig:
     content_rms_threshold: float = 0.025
     content_changed_fraction: float = 0.06
     content_tile_threshold: float = 0.06
+    global_dedup_rms_threshold: float = 0.004
+    global_dedup_changed_fraction: float = 0.003
+    global_dedup_tile_threshold: float = 0.01
+    global_dedup_patch_threshold: float = 0.02
     # 受保护采样：在开头和结尾两个时间窗口内，每 interval 秒额外标记一帧，
     # 仅当画面高度一致时才去重（用于捕获弹窗/横幅/开场状态等开头结尾的小变化）。
     protected_sample_interval: float = 2.0  # 0 = 禁用；>0 则每 N 秒一帧
@@ -996,97 +1000,54 @@ def _final_deduplicate(
     candidates: list[_Candidate],
     config: KeyframeConfig,
 ) -> tuple[list[_Candidate], list[_Candidate]]:
+    """跨全部最终候选检查高度重复，不受相邻关系或时间间隔限制。"""
     if not candidates:
         return [], []
-    color_signatures = {}
-
-    def color_signature(candidate):
-        if id(candidate) not in color_signatures:
-            color_signatures[id(candidate)] = _content_signature(candidate.path)
-        return color_signatures[id(candidate)]
-
-    groups: list[list[_Candidate]] = [[candidates[0]]]
-    for candidate in candidates[1:]:
-        previous = groups[-1][0]
-        rms, changed_fraction = _content_difference(
-            color_signature(previous), color_signature(candidate))
-        # 受保护帧使用更严格的去重阈值（仅高度一致时才合并）
-        is_any_protected = (
-            previous.source.startswith("protected")
-            or candidate.source.startswith("protected")
-        )
-        dedup_rms = (
-            config.protected_sample_dedup_rms
-            if is_any_protected
-            else config.final_dedup_rms_threshold
-        )
-        dedup_cf = (
-            config.protected_sample_dedup_cf
-            if is_any_protected
-            else config.final_dedup_changed_fraction_threshold
-        )
-        if rms < dedup_rms and changed_fraction < dedup_cf:
-            groups[-1].append(candidate)
+    signatures = {id(c): _content_signature(c.path) for c in candidates}
+    first = min(candidates, key=lambda c: c.time)
+    endpoints = {id(c) for c in candidates if c is first or c.keep_reason in {
+        "task-end-explicit", "task-end-auto", "final-frame"}}
+    # 首尾先确定；其他图片优先选择停留更充分的代表，不按时间顺序截断。
+    ordered = sorted([c for c in candidates if id(c) in endpoints], key=lambda c: c.time)
+    ordered += sorted([c for c in candidates if id(c) not in endpoints],
+                      key=lambda c: (c.support_s, c.novelty, c.time), reverse=True)
+    kept, removed = [], []
+    for candidate in ordered:
+        image = signatures[id(candidate)]
+        matches = []
+        checks = []
+        for representative in kept:
+            other = signatures[id(representative)]
+            rms, fraction = _content_difference(image, other)
+            tile = _tile_difference(image, other)
+            delta = np.max(np.abs(image.astype(np.float32) - other.astype(np.float32)), axis=-1) / 255.0
+            patch = float(delta.reshape(40, 4, 24, 4).mean(axis=(1, 3)).max())
+            similar = (rms < config.global_dedup_rms_threshold
+                       and fraction < config.global_dedup_changed_fraction
+                       and tile < config.global_dedup_tile_threshold
+                       and patch < config.global_dedup_patch_threshold)
+            checks.append({"time": representative.time, "rms": rms,
+                           "changed_fraction": fraction, "max_tile_difference": tile,
+                           "max_patch_difference": patch, "highly_similar": bool(similar)})
+            if similar:
+                matches.append(representative)
+        details = {"scope": "all_final_candidates", "comparisons": checks,
+                   "rms_threshold": config.global_dedup_rms_threshold,
+                   "changed_fraction_threshold": config.global_dedup_changed_fraction,
+                   "tile_threshold": config.global_dedup_tile_threshold,
+                   "patch_threshold": config.global_dedup_patch_threshold}
+        if matches and id(candidate) not in endpoints:
+            representative = min(matches, key=lambda c: _content_difference(image, signatures[id(c)])[0])
+            removed.append(candidate)
+            _note(candidate, "全局检查发现高度重复，保留了另一时刻的代表图", [representative],
+                  time_gap_s=abs(candidate.time - representative.time), **details)
         else:
-            groups.append([candidate])
-
-        _note(candidate, "", [previous], rms=rms, changed_fraction=changed_fraction,
-              rms_threshold=dedup_rms, changed_fraction_threshold=dedup_cf,
-              similar_to_previous=bool(rms < dedup_rms and changed_fraction < dedup_cf))
-
-    protected_reasons = {
-        "task-end-explicit",
-        "task-end-auto",
-        "final-frame",
-    }
-    ordinary_priority = {
-        "content-state": 3,
-        "transient-local-A-B-A": 3,
-        "stable-state-end": 2,
-        "stable-state-start": 1,
-    }
-    first_candidate = candidates[0]
-    kept: list[_Candidate] = []
-    removed: list[_Candidate] = []
-    for group in groups:
-        protected = [
-            candidate
-            for candidate in group
-            if candidate is first_candidate
-            or candidate.keep_reason in protected_reasons
-        ]
-        if protected:
-            group_kept = protected
-        else:
-            group_kept = [
-                max(
-                    group,
-                    key=lambda candidate: (
-                        ordinary_priority.get(candidate.keep_reason, 0),
-                        candidate.novelty,
-                        candidate.time,
-                    ),
-                )
-            ]
-        kept_ids = {id(candidate) for candidate in group_kept}
-        recorder = _PROCESS.get()
-        if recorder is not None:
-            for candidate in group:
-                old = recorder.notes.get(id(candidate), {})
-                details = dict(old.get("details", {}))
-                details["group_ids"] = [recorder.identify(c) for c in group]
-                _note(candidate,
-                      "保留为这一组的代表或首尾保护帧" if id(candidate) in kept_ids
-                      else "最后去重时归为相似画面，保留了同组的其他图片",
-                      [c for c in group_kept if c is not candidate], **details)
-        kept.extend(group_kept)
-        removed.extend(
-            candidate for candidate in group if id(candidate) not in kept_ids
-        )
-    return (
-        sorted(kept, key=lambda candidate: candidate.time),
-        sorted(removed, key=lambda candidate: candidate.time),
-    )
+            kept.append(candidate)
+            _note(candidate,
+                  "画面高度相似，但保留任务首尾位置" if matches else "全局检查后保留，未与已选图片高度重复",
+                  matches, **details)
+    # 只与最终确实留下的代表比较，不把 A≈B、B≈C 串联成 A≈C；去重后不补图凑数。
+    return sorted(kept, key=lambda c: c.time), sorted(removed, key=lambda c: c.time)
 
 
 def _hybrid_keyframes(
@@ -1201,7 +1162,7 @@ def _hybrid_keyframes(
     limited = _limit_candidates(content_unique, config.max_frames, config=config)
     _stage("budget", "按内容分配图片名额", content_unique, limited)
     selected, removed = _final_deduplicate(limited, config)
-    _stage("final", "最后去重 · 最终结果", limited, selected)
+    _stage("final", "全局去除高度重复 · 最终结果", limited, selected)
     return selected, removed, effective_task_end, task_end_confidence
 
 
