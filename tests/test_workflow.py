@@ -15,7 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from videosample import media, server
-from videosample.preparation import _operation_timing
+from videosample.preparation import _operation_timing, resolve_operation_video_path
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -76,6 +76,28 @@ def test_out_of_range_times_keep_auto_eval_fallback():
     assert supplied == {} and ignored == {"task_end_time"} and warnings
 
 
+@pytest.mark.parametrize("relative", [False, True])
+def test_server_video_outside_project_needs_no_allowlist(tmp_path, monkeypatch, relative):
+    project = tmp_path / "project"
+    project.mkdir()
+    video = tmp_path / "videos" / "outside.mp4"
+    video.parent.mkdir()
+    video.write_bytes(b"video")
+    monkeypatch.delenv("OPERATION_VIDEO_ROOTS", raising=False)
+    raw = "../videos/outside.mp4" if relative else str(video)
+    assert resolve_operation_video_path(raw, base_dir=project) == video.resolve()
+
+
+def test_relative_video_roots_still_find_external_files(tmp_path, monkeypatch):
+    project = tmp_path / "project"
+    project.mkdir()
+    video = tmp_path / "videos" / "outside.mp4"
+    video.parent.mkdir()
+    video.write_bytes(b"video")
+    monkeypatch.setenv("OPERATION_VIDEO_ROOTS", str(video.parent))
+    assert resolve_operation_video_path("outside.mp4", base_dir=project) == video.resolve()
+
+
 def test_remote_video_download_and_batch_record(tmp_path, monkeypatch, video):
     payload = video.read_bytes()
 
@@ -122,7 +144,7 @@ def test_remote_video_download_and_batch_record(tmp_path, monkeypatch, video):
 
 def test_xlsx_batch_api(tmp_path, monkeypatch, video):
     monkeypatch.setattr(server, "RUNS", tmp_path / "runs")
-    monkeypatch.setenv("OPERATION_VIDEO_ROOTS", str(tmp_path))
+    monkeypatch.delenv("OPERATION_VIDEO_ROOTS", raising=False)
     table = io.BytesIO()
     with pd.ExcelWriter(table, engine="openpyxl") as writer:
         pd.DataFrame([{"id": "other", "query": "其他页", "video_path": "wrong.mp4"}]).to_excel(writer, sheet_name="其他", index=False)

@@ -1,4 +1,4 @@
-"""路径与时间处理摘自 auto_eval，保持原规则。"""
+"""沿用 auto_eval 的时间处理；实验台直接接受服务器本地视频路径。"""
 import os
 import math
 import json
@@ -10,7 +10,7 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
 _TASK_TIME_FIELDS = ("task_start_time", "task_end_time")
 
 def operation_video_roots(base_dir: Path = PROJECT_ROOT) -> list[Path]:
-    """返回批量清单允许读取、解析相对路径的视频根目录。"""
+    """返回相对视频路径的查找目录，不限制绝对路径。"""
     roots = [base_dir.resolve()]
     for raw in os.getenv("OPERATION_VIDEO_ROOTS", "").split(os.pathsep):
         if raw.strip():
@@ -25,25 +25,18 @@ def resolve_operation_video_path(
     *,
     base_dir: Path = PROJECT_ROOT,
 ) -> Path:
-    """解析本地视频路径，并阻止读取未授权目录。"""
+    """解析服务器本地视频；绝对路径直接读取，相对路径按根目录查找。"""
     candidate = Path(raw_path).expanduser()
     roots = operation_video_roots(base_dir)
     if candidate.is_absolute():
         candidate = candidate.resolve()
-        if not any(candidate.is_relative_to(root) for root in roots):
-            raise ValueError(
-                "视频路径不在允许目录中；外部目录需通过 "
-                "OPERATION_VIDEO_ROOTS 配置"
-            )
     else:
         attempted: list[Path] = []
         matches: list[Path] = []
         for root in roots:
             resolved = (root / candidate).resolve()
-            if not resolved.is_relative_to(root):
-                continue
             attempted.append(resolved)
-            if resolved.is_file():
+            if resolved.is_file() and resolved not in matches:
                 matches.append(resolved)
         if not matches:
             locations = "\n".join(f"- {path}" for path in attempted)
