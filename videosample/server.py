@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import threading
@@ -13,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from pathlib import Path
+from numbers import Real
 from typing import Literal
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -171,8 +173,31 @@ def list_runs():
 @app.get("/api/runs/{identity}")
 def get_run(identity: str):
     run = read_run(identity)
+    run["statistics"] = chain_statistics(run)
     run["chains"] = chain_summaries(run)
     return run
+
+
+def chain_statistics(run):
+    """只统计本次链路的成功样本；缺失数据不按零计入平均值。"""
+    rows = run.get("rows", [])
+    successful = [row for row in rows if row.get("status") == "done"]
+
+    def metric(values):
+        valid = [float(value) for value in values if isinstance(value, Real)
+                 and not isinstance(value, bool) and math.isfinite(value) and value >= 0]
+        return {"samples": len(valid), "total": round(sum(valid), 3) if valid else None,
+                "mean": round(sum(valid) / len(valid), 3) if valid else None}
+
+    return {"total_samples": len(rows),
+            "selected_samples": sum(row.get("status") != "skipped" for row in rows),
+            "successful_samples": len(successful),
+            "failed_samples": sum(row.get("status") in {"error", "interrupted"} for row in rows),
+            "sample_time_s": metric(row.get("elapsed_s") for row in successful),
+            "extraction_time_s": metric((row.get("timings_s") or {}).get("extraction") for row in successful),
+            "initial_frames": metric(row.get("initial_frame_count", (row.get("stage_counts") or {}).get("collected"))
+                                     for row in successful),
+            "final_frames": metric(row.get("frame_count") for row in successful)}
 
 
 def chain_summaries(run):
@@ -181,6 +206,7 @@ def chain_summaries(run):
         chain = run if identity == run["id"] else read_run(identity)
         result.append({"key": key, "id": identity, "name": "base · 固定链路" if key == "base" else "实验链路",
                        "status": chain["status"], "count": len(chain["rows"]),
+                       "version": chain.get("version"), "statistics": chain_statistics(chain),
                        "done": sum(row["status"] == "done" for row in chain["rows"]),
                        "failed": sum(row["status"] in {"error", "interrupted"} for row in chain["rows"])})
     return result
@@ -296,6 +322,7 @@ def process_row(identity: str, index: int):
         counts = {stage["id"]: len(stage["output_ids"]) for stage in recorder.stages}
         metadata = json.loads((directory / "final" / "keyframes.json").read_text(encoding="utf-8"))
         update_row(identity, index, status="done", message="抽帧完成", frame_count=len(frames),
+                   initial_frame_count=getattr(recorder, "initial_frame_count", counts.get("collected")),
                    effective_config=metadata["config"],
                    stages=[{"id": stage["id"], "title": stage["title"]} for stage in recorder.stages],
                    stage_counts=counts, timings_s=timings, elapsed_s=round(time.monotonic() - started, 2))

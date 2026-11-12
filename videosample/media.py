@@ -72,6 +72,7 @@ class _ProcessRecord:
         self.frames = []
         self.stages = []
         self.notes = {}
+        self.initial_frame_count = None
         self.timings = {}
         self.record_io_s = 0.0
         self.last_stage_end = time.perf_counter()
@@ -94,6 +95,8 @@ class _ProcessRecord:
         self.timings[key] = self.timings.get(key, 0.0) + elapsed
         before_ids = [self.identify(c) for c in before]
         after_ids = [self.identify(c) for c in after]
+        if self.initial_frame_count is None:
+            self.initial_frame_count = len(after_ids)
         selected = set(after_ids)
         events = []
         seen = set()
@@ -123,6 +126,7 @@ class _ProcessRecord:
     def save(self):
         started = time.perf_counter()
         payload = {"algorithm_version": KEYFRAME_ALGORITHM_VERSION,
+                   "initial_frame_count": self.initial_frame_count,
                    "frames": self.frames, "stages": self.stages,
                    "timings_s": {**{key: round(value, 4) for key, value in self.timings.items()},
                                  "process_io": round(self.record_io_s, 4)}}

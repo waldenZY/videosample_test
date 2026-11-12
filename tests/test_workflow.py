@@ -244,6 +244,8 @@ def test_paired_chains_have_independent_steps(tmp_path, monkeypatch, video):
         other_trace = client.get(f"/api/runs/{other_id}/items/0/trace").json()
         assert len(base_trace["stages"]) == 7 and len(other_trace["stages"]) == 1
         assert base["rows"][0]["video_sha256"] == other["rows"][0]["video_sha256"]
+        assert base["rows"][0]["initial_frame_count"] == base["rows"][0]["stage_counts"]["collected"]
+        assert other["rows"][0]["initial_frame_count"] >= other["rows"][0]["frame_count"]
         assert "stages" not in base["rows"][0]["timings_s"]
         assert "stages" in other["rows"][0]["timings_s"]
         assert "process_io" in other["rows"][0]["timings_s"]["stages"]
