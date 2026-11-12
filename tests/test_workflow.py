@@ -42,11 +42,11 @@ def video(tmp_path):
 
 
 @pytest.mark.parametrize("kwargs", [{"task_end_time": 13}, {}, {"task_end_time": 13, "sample_fps": 10}])
-def test_recording_preserves_original_results(tmp_path, video, baseline, kwargs):
+def test_base_recording_preserves_original_results(tmp_path, video, baseline, kwargs):
     original_dir, experiment_dir = tmp_path / "original", tmp_path / "experiment"
     original = baseline.extract_scene_keyframes(video, original_dir, max_edge=120, **kwargs)
-    with media.record_process(tmp_path / "process"):
-        experiment = media.extract_scene_keyframes(video, experiment_dir, max_edge=120, **kwargs)
+    with base_media.record_process(tmp_path / "process"):
+        experiment = base_media.extract_scene_keyframes(video, experiment_dir, max_edge=120, **kwargs)
     assert len(experiment) == len(original)
     assert [hashlib.sha256(p.read_bytes()).hexdigest() for p in experiment] == [
         hashlib.sha256(p.read_bytes()).hexdigest() for p in original]

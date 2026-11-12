@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 
 
-KEYFRAME_ALGORITHM_VERSION = "hybrid-state-v3.2.0"
+KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v1"
 DEFAULT_TASK_START_TIME = 7.0
 
 # 仅供实验台记录过程；不参与任何选帧决策。定稿迁回时可整体移除。
@@ -175,9 +175,9 @@ class KeyframeConfig:
     task_start_time: float = DEFAULT_TASK_START_TIME
     task_end_time: float | None = None
     max_frames: int = 20
-    sample_fps: float = 1.0
-    scene_threshold: float = 0.06
-    scene_min_gap_s: float = 0.8
+    sample_fps: float = 4.0
+    scene_threshold: float = 0.02
+    scene_min_gap_s: float = 0.15
     timestamp_merge_gap_s: float = 0.25
     state_layout_threshold: float = 0.05
     stable_min_duration_s: float = 1.5
@@ -297,7 +297,7 @@ def probe_duration(video: Path | str) -> float:
 
 def scene_change_times(
     video: Path | str,
-    threshold: float = 0.06,
+    threshold: float = 0.02,
     *,
     end_time: float | None = None,
 ) -> list[float]:
@@ -352,8 +352,8 @@ def select_keyframe_times(
     video: Path | str,
     max_frames: int = 20,
     min_frames: int = 4,
-    threshold: float = 0.06,
-    min_gap_s: float = 0.8,
+    threshold: float = 0.02,
+    min_gap_s: float = 0.15,
     *,
     task_start_time: float = DEFAULT_TASK_START_TIME,
     task_end_time: float | None = None,
@@ -479,6 +479,20 @@ def _visual_difference(
     return rms, changed_fraction
 
 
+def _content_signature(path: Path) -> np.ndarray:
+    """相近时刻合并时看完整彩色画面，避免漏掉顶部提示或颜色变化。"""
+    from PIL import Image
+
+    with Image.open(path) as image:
+        return np.asarray(image.convert("RGB").resize((96, 160)), dtype=np.float32)
+
+
+def _content_difference(left: np.ndarray, right: np.ndarray) -> tuple[float, float]:
+    delta = np.abs(left - right)
+    return (float(np.sqrt(np.mean(delta * delta)) / 255.0),
+            float(np.mean(np.any(delta >= 12.0, axis=-1))))
+
+
 def _layout_distance(left: np.ndarray, right: np.ndarray) -> float:
     return float(np.sqrt(np.mean((left - right) ** 2)) / 255.0)
 
@@ -552,7 +566,7 @@ def _extract_candidates(
     # 使其在后续各阶段优先保留，仅当画面高度一致时才去重
     # （用于捕获弹窗/横幅/开场状态等开头结尾的小变化）。
     fps_source = f"{config.sample_fps:g}fps"
-    ps_interval = round(config.protected_sample_interval)
+    ps_interval = config.protected_sample_interval
     if ps_interval > 0 and (config.protected_begin_window > 0 or config.protected_end_window > 0):
         protected_begin_end = effective_start + config.protected_begin_window
         protected_end_start = algorithm_end - config.protected_end_window
@@ -563,12 +577,14 @@ def _extract_candidates(
             # 开头窗口：[effective_start, effective_start + protected_begin_window]
             # 帧时间相对起点的偏移能被 interval 整除则保留
             if config.protected_begin_window > 0 and effective_start <= c.time <= protected_begin_end:
-                if round(c.time - effective_start) % ps_interval == 0:
+                offset = (c.time - effective_start) % ps_interval
+                if min(offset, ps_interval - offset) <= interval / 2 + 1e-6:
                     protected = True
             # 结尾窗口：[algorithm_end - protected_end_window, algorithm_end]
             # 帧时间相对终点的偏移能被 interval 整除则保留
             if not protected and config.protected_end_window > 0 and protected_end_start <= c.time <= algorithm_end:
-                if round(algorithm_end - c.time) % ps_interval == 0:
+                offset = (algorithm_end - c.time) % ps_interval
+                if min(offset, ps_interval - offset) <= interval / 2 + 1e-6:
                     protected = True
             if protected:
                 c.source = f"protected-{config.protected_sample_interval:g}s"
@@ -653,39 +669,76 @@ def _extract_candidates(
 def _canonicalize_timestamps(
     candidates: list[_Candidate],
     gap: float,
+    *,
+    config: KeyframeConfig | None = None,
 ) -> list[_Candidate]:
+    """只合并时间接近且画面相似的候选；每组时间范围有界。"""
     if not candidates:
         return []
-    groups: list[list[_Candidate]] = [[candidates[0]]]
-    for candidate in candidates[1:]:
-        if candidate.time - groups[-1][-1].time <= gap:
-            groups[-1].append(candidate)
-        else:
-            groups.append([candidate])
+    config = config or KeyframeConfig()
+    signatures = {}
 
-    def priority(candidate: _Candidate) -> tuple[int, float]:
+    def signature(candidate):
+        if id(candidate) not in signatures:
+            signatures[id(candidate)] = (candidate.time, _content_signature(candidate.path))
+        return signatures[id(candidate)][1]
+
+    def priority(candidate):
         if candidate.source.startswith("start"):
             return (0, candidate.time)
-        if candidate.source.startswith("protected"):
-            return (1, candidate.time)
         if candidate.source == "task-end":
+            return (1, candidate.time)
+        if candidate.source.startswith("protected"):
             return (2, candidate.time)
         if candidate.source.startswith("scene"):
             return (3, candidate.time)
         return (4, candidate.time)
+
+    def endpoint(candidate):
+        return candidate.source.startswith("start") or candidate.source == "task-end"
+
+    groups = []
+    comparisons = {}
+    for candidate in sorted(candidates, key=lambda c: c.time):
+        for identity, (timestamp, _) in list(signatures.items()):
+            if candidate.time - timestamp > gap + 1e-9:
+                del signatures[identity]
+        checks = []
+        merged = False
+        for group in reversed(groups):
+            if candidate.time - group[0].time > gap + 1e-9:
+                break
+            winner = min(group, key=priority)
+            if endpoint(candidate) and any(endpoint(c) for c in group):
+                continue
+            rms, fraction = _content_difference(signature(candidate), signature(winner))
+            checks.append((winner, rms, fraction))
+            if (rms < config.final_dedup_rms_threshold
+                    and fraction < config.final_dedup_changed_fraction_threshold):
+                group.append(candidate)
+                merged = True
+                break
+        if not merged:
+            groups.append([candidate])
+        comparisons[id(candidate)] = checks
 
     result = []
     for group in groups:
         winner = min(group, key=priority)
         result.append(winner)
         for candidate in group:
+            checks = comparisons[id(candidate)]
+            related = [c for c in group if c is not candidate]
+            related.extend(c for c, _, _ in checks if c is not candidate and c not in related)
             _note(candidate,
-                  "相近时刻中优先保留这张" if candidate is winner else "相近时刻归为一组，优先保留另一张",
-                  [c for c in group if c is not candidate],
-                  merge_gap_s=gap, priority=priority(candidate)[0],
-                  group_start=group[0].time, group_end=group[-1].time,
-                  rule="按相邻时间串联分组；首帧、保护采样、指定结束帧、变化帧依次优先")
-    return result
+                  ("时间接近但没有相同画面，单独保留" if len(group) == 1 else "相近且相似的画面中保留这一张")
+                  if candidate is winner else "相近时刻画面相似，合并到同组代表图",
+                  related, merge_gap_s=gap, group_start=group[0].time, group_end=group[-1].time,
+                  rms_threshold=config.final_dedup_rms_threshold,
+                  changed_fraction_threshold=config.final_dedup_changed_fraction_threshold,
+                  comparisons=[{"time": c.time, "rms": rms, "changed_fraction": fraction}
+                               for c, rms, fraction in checks])
+    return sorted(result, key=lambda c: c.time)
 
 
 def _build_layout_runs(
@@ -795,22 +848,6 @@ def _deduplicate_states(
         >= config.stable_min_duration_s
     }
 
-    transient_runs: set[int] = set()
-    for run_index in range(1, len(runs) - 1):
-        if run_index in stable_runs:
-            continue
-        run = runs[run_index]
-        run_duration = candidates[run[-1]].time - candidates[run[0]].time
-        surrounding_distance = _layout_distance(
-            layouts[runs[run_index - 1][-1]],
-            layouts[runs[run_index + 1][0]],
-        )
-        if (
-            run_duration <= config.transient_max_duration_s
-            and surrounding_distance < config.transient_return_threshold
-        ):
-            transient_runs.add(run_index)
-
     selected_indices: set[int] = set()
     # 受保护帧跳过状态聚类去重，始终保留
     protected_indices = {
@@ -821,50 +858,31 @@ def _deduplicate_states(
         first, last = run[0], run[-1]
         for index in run:
             _note(candidates[index],
-                  "同一页面中未选为代表" if run_index in stable_runs else "中间页面停留较短，未达到普通保留条件",
+                  "同一页面中未选为代表" if run_index in stable_runs else "短暂页面只保留代表画面",
                   [candidates[first], candidates[last]],
                   run=run_index + 1,
                   sampled_duration_s=round(candidates[last].time - candidates[first].time, 3),
                   stable_min_duration_s=config.stable_min_duration_s)
-        if run_index in transient_runs:
-            before = layouts[runs[run_index - 1][-1]]
-            after = layouts[runs[run_index + 1][0]]
-            peak = max(
-                run,
-                key=lambda index: min(
-                    _layout_distance(layouts[index], before),
-                    _layout_distance(layouts[index], after),
-                ),
-            )
-            peak_pixels = _signature(candidates[peak].path)
-            before_pixels = _signature(
-                candidates[runs[run_index - 1][-1]].path
-            )
-            after_pixels = _signature(
-                candidates[runs[run_index + 1][0]].path
-            )
-            changed_against_both = (
-                (np.abs(peak_pixels - before_pixels) >= 12.0)
-                & (np.abs(peak_pixels - after_pixels) >= 12.0)
-            )
-            changed_fraction = float(np.mean(changed_against_both))
-            if (
-                config.transient_min_changed_fraction
-                <= changed_fraction
-                <= config.transient_max_changed_fraction
-            ):
-                selected_indices.add(peak)
-                candidates[peak].keep_reason = "transient-local-A-B-A"
-                _note(candidates[peak], "短暂变化后回到原页面，保留变化最明显的画面",
-                      [candidates[runs[run_index - 1][-1]], candidates[runs[run_index + 1][0]]],
-                      changed_fraction=changed_fraction)
-            else:
-                _note(candidates[peak], "虽返回原页面，但变化面积不符合短暂提示的保留条件",
-                      changed_fraction=changed_fraction,
-                      min_fraction=config.transient_min_changed_fraction,
-                      max_fraction=config.transient_max_changed_fraction)
-            continue
         if run_index not in stable_runs:
+            representatives = []
+            previous_pixels = None
+            for index in run:
+                pixels = _content_signature(candidates[index].path)
+                rms, fraction = ((1.0, 1.0) if previous_pixels is None else
+                                 _content_difference(previous_pixels, pixels))
+                if (previous_pixels is None or rms >= config.final_dedup_rms_threshold
+                        or fraction >= config.final_dedup_changed_fraction_threshold):
+                    selected_indices.add(index)
+                    candidates[index].keep_reason = "short-state"
+                    _note(candidates[index], "页面虽短暂，但内容不同，保留画面",
+                          [candidates[representatives[-1]]] if representatives else [],
+                          rms=rms, changed_fraction=fraction,
+                          sampled_duration_s=candidates[last].time - candidates[first].time)
+                    representatives.append(index)
+                    previous_pixels = pixels
+                else:
+                    _note(candidates[index], "短暂页面内画面相似，保留已有代表图",
+                          [candidates[representatives[-1]]], rms=rms, changed_fraction=fraction)
             continue
 
         selected_indices.add(first)
@@ -906,6 +924,7 @@ def _limit_candidates(
         if candidate.keep_reason
         in {
             "stable-state-start",
+            "short-state",
             "transient-local-A-B-A",
             "task-end-explicit",
             "task-end-auto",
@@ -926,6 +945,7 @@ def _limit_candidates(
             or candidates[index].keep_reason
             in {
                 "transient-local-A-B-A",
+                "short-state",
                 "task-end-explicit",
                 "task-end-auto",
                 "final-frame",
@@ -967,13 +987,22 @@ def _final_deduplicate(
     signatures = {
         id(candidate): _signature(candidate.path) for candidate in candidates
     }
+    color_signatures = {}
+
+    def color_signature(candidate):
+        if id(candidate) not in color_signatures:
+            color_signatures[id(candidate)] = _content_signature(candidate.path)
+        return color_signatures[id(candidate)]
+
     groups: list[list[_Candidate]] = [[candidates[0]]]
     for candidate in candidates[1:]:
         previous = groups[-1][-1]
-        rms, changed_fraction = _visual_difference(
-            signatures[id(previous)],
-            signatures[id(candidate)],
-        )
+        if previous.keep_reason == "short-state" or candidate.keep_reason == "short-state":
+            rms, changed_fraction = _content_difference(
+                color_signature(previous), color_signature(candidate))
+        else:
+            rms, changed_fraction = _visual_difference(
+                signatures[id(previous)], signatures[id(candidate)])
         # 受保护帧使用更严格的去重阈值（仅高度一致时才合并）
         is_any_protected = (
             previous.source.startswith("protected")
@@ -1004,6 +1033,7 @@ def _final_deduplicate(
         "final-frame",
     }
     ordinary_priority = {
+        "short-state": 3,
         "transient-local-A-B-A": 3,
         "stable-state-end": 2,
         "stable-state-start": 1,
@@ -1078,10 +1108,11 @@ def _hybrid_keyframes(
     all_timestamp_unique = _canonicalize_timestamps(
         algorithm_candidates,
         config.timestamp_merge_gap_s,
+        config=config,
     )
     for candidate in terminal_candidates:
         _note(candidate, "视频末帧单独保留，暂不参与相近时刻合并")
-    _stage("timestamps", "合并相近时刻", raw,
+    _stage("timestamps", "合并近时刻的重复画面", raw,
            all_timestamp_unique + terminal_candidates)
 
     task_end_candidate: _Candidate | None = None
@@ -1177,13 +1208,13 @@ def extract_scene_keyframes(
     out_dir: Path | str,
     max_frames: int = 20,
     min_frames: int = 4,
-    threshold: float = 0.06,
-    min_gap_s: float = 0.8,
+    threshold: float = 0.02,
+    min_gap_s: float = 0.15,
     max_edge: int = 720,
     *,
     task_start_time: float = DEFAULT_TASK_START_TIME,
     task_end_time: float | None = None,
-    sample_fps: float = 1.0,
+    sample_fps: float = 4.0,
     config: KeyframeConfig | None = None,
     algorithm_version: str = KEYFRAME_ALGORITHM_VERSION,
 ) -> list[Path]:
@@ -1304,14 +1335,14 @@ def video_to_frame_urls(
     out_dir: Path | str | None = None,
     max_frames: int = 20,
     min_frames: int = 4,
-    threshold: float = 0.06,
-    min_gap_s: float = 0.8,
+    threshold: float = 0.02,
+    min_gap_s: float = 0.15,
     max_edge: int = 768,
     quality: int = 70,
     *,
     task_start_time: float = DEFAULT_TASK_START_TIME,
     task_end_time: float | None = None,
-    sample_fps: float = 1.0,
+    sample_fps: float = 4.0,
     config: KeyframeConfig | None = None,
 ) -> list[str]:
     """抽帧并编码为裁判可直接使用的 image_url 列表。"""
