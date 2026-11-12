@@ -1,0 +1,9 @@
+{
+  "source_project": "auto_eval_agent",
+  "source_path": "src/auto_eval/media.py",
+  "source_commit": "45dd11a1b8603b76989276d59dfdcb94bffc42b5",
+  "algorithm_version": "hybrid-state-v3.2.0",
+  "sha256": "bd79ef7e7b57780bcfae19d7f1f23001e45840f29d59087706bd1740edf1e646",
+  "copied_on": "2026-11-12",
+  "note": "Exact working-tree copy; source git status was clean at capture."
+}
