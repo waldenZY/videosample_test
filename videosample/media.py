@@ -16,10 +16,12 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
+from collections import OrderedDict
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
-from functools import lru_cache
+from functools import lru_cache, wraps
 from numbers import Integral, Real
 from pathlib import Path
 
@@ -31,6 +33,35 @@ DEFAULT_TASK_START_TIME = 7.0
 
 # 仅供实验台记录过程；不参与任何选帧决策。定稿迁回时可整体移除。
 _PROCESS = ContextVar("keyframe_process", default=None)
+_FEATURES = ContextVar("keyframe_features", default=None)
+
+
+def _cached_feature(function):
+    @wraps(function)
+    def cached(path):
+        cache = _FEATURES.get()
+        if cache is None:
+            return function(path)
+        key = (function.__name__, str(path))
+        if key not in cache:
+            cache[key] = function(path)
+            if len(cache) > 512:
+                cache.popitem(last=False)
+        else:
+            cache.move_to_end(key)
+        return cache[key]
+    return cached
+
+
+def _with_feature_cache(function):
+    @wraps(function)
+    def cached(*args, **kwargs):
+        token = _FEATURES.set(OrderedDict())
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _FEATURES.reset(token)
+    return cached
 
 
 class _ProcessRecord:
@@ -41,6 +72,9 @@ class _ProcessRecord:
         self.frames = []
         self.stages = []
         self.notes = {}
+        self.timings = {}
+        self.record_io_s = 0.0
+        self.last_stage_end = time.perf_counter()
 
     def identify(self, candidate):
         identity = self.identities.get(id(candidate))
@@ -55,6 +89,9 @@ class _ProcessRecord:
         return identity
 
     def stage(self, key, title, before, after, fallback):
+        started = time.perf_counter()
+        elapsed = started - self.last_stage_end
+        self.timings[key] = self.timings.get(key, 0.0) + elapsed
         before_ids = [self.identify(c) for c in before]
         after_ids = [self.identify(c) for c in after]
         selected = set(after_ids)
@@ -74,20 +111,30 @@ class _ProcessRecord:
                      "details": note.get("details", {}), "keep_reason": candidate.keep_reason}
             events.append(event)
             self.frames[int(identity[1:]) - 1]["history"].append(event)
-        self.stages.append({"id": key, "title": title, "input_ids": before_ids,
+        self.stages.append({"id": key, "title": title, "elapsed_s": round(elapsed, 4), "input_ids": before_ids,
                             "output_ids": after_ids,
                             "removed_ids": [i for i in before_ids if i not in selected],
                             "events": events})
         self.notes.clear()
+        self.record_io_s += time.perf_counter() - started
         self.save()
+        self.last_stage_end = time.perf_counter()
 
     def save(self):
+        started = time.perf_counter()
         payload = {"algorithm_version": KEYFRAME_ALGORITHM_VERSION,
-                   "frames": self.frames, "stages": self.stages}
+                   "frames": self.frames, "stages": self.stages,
+                   "timings_s": {**{key: round(value, 4) for key, value in self.timings.items()},
+                                 "process_io": round(self.record_io_s, 4)}}
         target = self.directory / "trace.json"
         temporary = target.with_suffix(".tmp")
         temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(target)
+        self.record_io_s += time.perf_counter() - started
+
+    def timing_summary(self):
+        return {**{key: round(value, 4) for key, value in self.timings.items()},
+                "process_io": round(self.record_io_s, 4)}
 
 
 @contextmanager
@@ -95,11 +142,17 @@ def record_process(directory: Path | str):
     """实验时保留候选图与每步决定；不改变抽帧入口及返回值。"""
     recorder = _ProcessRecord(Path(directory))
     token = _PROCESS.set(recorder)
+    completed = False
     try:
         yield recorder
+        completed = True
     finally:
-        recorder.save()
-        _PROCESS.reset(token)
+        try:
+            key = "other_processing" if completed else "unfinished"
+            recorder.timings[key] = time.perf_counter() - recorder.last_stage_end
+            recorder.save()
+        finally:
+            _PROCESS.reset(token)
 
 
 def _note(candidate, reason, related=None, **details):
@@ -453,6 +506,7 @@ def _extract_at(
     return output.is_file()
 
 
+@_cached_feature
 def _signature(path: Path) -> np.ndarray:
     from PIL import Image
 
@@ -461,6 +515,7 @@ def _signature(path: Path) -> np.ndarray:
     return array[12:154, :]
 
 
+@_cached_feature
 def _layout_signature(path: Path) -> np.ndarray:
     from PIL import Image, ImageFilter
 
@@ -470,6 +525,7 @@ def _layout_signature(path: Path) -> np.ndarray:
     return array[2:-1, :]
 
 
+@_cached_feature
 def _assistant_shell_signature(path: Path) -> np.ndarray:
     from PIL import Image, ImageFilter
 
@@ -489,6 +545,7 @@ def _visual_difference(
     return rms, changed_fraction
 
 
+@_cached_feature
 def _content_signature(path: Path) -> np.ndarray:
     """相近时刻合并时看完整彩色画面，避免漏掉顶部提示或颜色变化。"""
     from PIL import Image
@@ -962,7 +1019,11 @@ def _limit_candidates(candidates, limit, *, config=None):
         rms, _ = _content_difference(pixels[id(left)], pixels[id(right)])
         return rms + 0.5 * _tile_difference(pixels[id(left)], pixels[id(right)])
 
-    nearest = {id(c): min(distance(c, other) for other in selected) for c in candidates if c not in selected}
+    nearest, nearest_to = {}, {}
+    for candidate in candidates:
+        if candidate not in selected:
+            value, other = min(((distance(candidate, other), other) for other in selected), key=lambda pair: pair[0])
+            nearest[id(candidate)], nearest_to[id(candidate)] = value, other
     decisions = {id(c): "保留任务首帧或结束位置" for c in selected}
     while len(selected) < min(limit, len(candidates)):
         remaining = [c for c in candidates if c not in selected]
@@ -979,19 +1040,22 @@ def _limit_candidates(candidates, limit, *, config=None):
         decisions[id(best)] = "为尚未覆盖的页面保留内容代表" if uncovered else "优先保留新增内容较多的画面"
         selected.append(best)
         nearest.pop(id(best))
+        nearest_to.pop(id(best))
         for candidate in remaining:
             if candidate is not best:
-                nearest[id(candidate)] = min(nearest[id(candidate)], distance(candidate, best))
+                value = distance(candidate, best)
+                if value < nearest[id(candidate)]:
+                    nearest[id(candidate)], nearest_to[id(candidate)] = value, best
     selected_ids = {id(c) for c in selected}
     for candidate in candidates:
         if id(candidate) in selected_ids:
             _note(candidate, decisions[id(candidate)], frame_limit=limit, page=candidate.page_id + 1,
                   support_s=candidate.support_s)
         else:
-            other = min(selected, key=lambda c: distance(candidate, c))
+            other = nearest_to[id(candidate)]
             _note(candidate, "内容名额已满，优先覆盖不同页面及差异更大的内容", [other],
                   frame_limit=limit, page=candidate.page_id + 1,
-                  distance_to_retained=distance(candidate, other),
+                  distance_to_retained=nearest[id(candidate)],
                   note="相关图是最相近的已选画面，不表示全部内容都相同或已完整覆盖")
     return sorted(selected, key=lambda c: c.time)
 
@@ -1069,6 +1133,7 @@ def _final_deduplicate(
     return sorted(kept, key=lambda c: c.time), sorted(removed, key=lambda c: c.time)
 
 
+@_with_feature_cache
 def _hybrid_keyframes(
     video: Path,
     work_dir: Path,

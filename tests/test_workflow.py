@@ -184,6 +184,8 @@ def test_xlsx_batch_api(tmp_path, monkeypatch, video):
             time.sleep(0.1)
         assert run["status"] == "done", run
         assert [row["status"] for row in run["rows"]] == ["done", "error"]
+        assert run["rows"][0]["timings_s"]["extraction"] >= 0
+        assert run["rows"][1]["timings_s"]["video_prepare"] >= 0
         detail = client.get(f"/api/runs/{identity}/items/0/trace").json()
         assert len(detail["stages"]) == 7
         frame_id = detail["frames"][0]["id"]
@@ -242,6 +244,9 @@ def test_paired_chains_have_independent_steps(tmp_path, monkeypatch, video):
         other_trace = client.get(f"/api/runs/{other_id}/items/0/trace").json()
         assert len(base_trace["stages"]) == 7 and len(other_trace["stages"]) == 1
         assert base["rows"][0]["video_sha256"] == other["rows"][0]["video_sha256"]
+        assert "stages" not in base["rows"][0]["timings_s"]
+        assert "stages" in other["rows"][0]["timings_s"]
+        assert "process_io" in other["rows"][0]["timings_s"]["stages"]
         copied = client.post(f"/api/runs/{other_id}/copy").json()
         assert "chain_ids" not in copied and "group_id" not in copied
         copied = client.post(f"/api/runs/{copied['id']}/start", json={}).json()

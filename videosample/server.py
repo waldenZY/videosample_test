@@ -10,7 +10,7 @@ import time
 import uuid
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -262,27 +262,35 @@ def process_row(identity: str, index: int):
     directory = run_directory(identity) / "items" / f"{index:05d}"
     directory.mkdir(parents=True, exist_ok=True)
     item = read_run(identity)["rows"][index]["item"]
+    timings = {}
+    recorder = None
     try:
         run = read_run(identity)
         algorithm = algorithms.implementation(run.get("algorithm", {}).get("key", "base"))
         update_row(identity, index, status="running", message="正在准备视频")
         if is_remote_video_url(item["video_path"]):
             update_row(identity, index, message="正在下载视频")
-        video = prepared_video(run, index, item)
-        (directory / "video_ref.json").write_text(json.dumps({"path": str(video)}, ensure_ascii=False), encoding="utf-8")
-        duration = algorithm.probe_duration(video)
-        if duration <= 0:
-            raise ValueError("无法读取视频或视频时长为 0")
-        kwargs, _, warnings, _ = _operation_timing(item, duration,
+        with measure_phase(timings, "video_prepare"):
+            video = prepared_video(run, index, item)
+            (directory / "video_ref.json").write_text(json.dumps({"path": str(video)}, ensure_ascii=False), encoding="utf-8")
+        with measure_phase(timings, "probe"):
+            duration = algorithm.probe_duration(video)
+            if duration <= 0:
+                raise ValueError("无法读取视频或视频时长为 0")
+            kwargs, _, warnings, _ = _operation_timing(item, duration,
                                                   default_start_time=algorithm.DEFAULT_TASK_START_TIME)
-        with video.open("rb") as handle:
-            digest = hashlib.sha256()
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
+        with measure_phase(timings, "fingerprint"):
+            with video.open("rb") as handle:
+                digest = hashlib.sha256()
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
         update_row(identity, index, message="正在抽帧并记录处理过程", duration=duration,
-                   warnings=warnings, video_sha256=digest.hexdigest())
-        with algorithm.record_process(directory / "process") as recorder:
-            frames = algorithm.extract_scene_keyframes(video, directory / "final", **kwargs)
+                   warnings=warnings, video_sha256=digest.hexdigest(), timings_s=timings)
+        with measure_phase(timings, "extraction"):
+            with algorithm.record_process(directory / "process") as recorder:
+                frames = algorithm.extract_scene_keyframes(video, directory / "final", **kwargs)
+        if hasattr(recorder, "timing_summary"):
+            timings["stages"] = recorder.timing_summary()
         if not frames:
             raise ValueError("视频未能抽出有效图片，请检查视频与任务时间范围")
         counts = {stage["id"]: len(stage["output_ids"]) for stage in recorder.stages}
@@ -290,10 +298,21 @@ def process_row(identity: str, index: int):
         update_row(identity, index, status="done", message="抽帧完成", frame_count=len(frames),
                    effective_config=metadata["config"],
                    stages=[{"id": stage["id"], "title": stage["title"]} for stage in recorder.stages],
-                   stage_counts=counts, elapsed_s=round(time.monotonic() - started, 2))
+                   stage_counts=counts, timings_s=timings, elapsed_s=round(time.monotonic() - started, 2))
     except Exception as exc:
+        if recorder is not None and hasattr(recorder, "timing_summary"):
+            timings["stages"] = recorder.timing_summary()
         update_row(identity, index, status="error", message="本题失败", error=str(exc),
-                   elapsed_s=round(time.monotonic() - started, 2))
+                   timings_s=timings, elapsed_s=round(time.monotonic() - started, 2))
+
+
+@contextmanager
+def measure_phase(timings, key):
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        timings[key] = round(time.perf_counter() - started, 4)
 
 
 def item_directory(identity: str, index: int):
