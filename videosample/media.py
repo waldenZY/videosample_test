@@ -1016,6 +1016,7 @@ def _final_deduplicate(
         image = signatures[id(candidate)]
         matches = []
         checks = []
+        comparisons = []
         for representative in kept:
             other = signatures[id(representative)]
             rms, fraction = _content_difference(image, other)
@@ -1026,9 +1027,17 @@ def _final_deduplicate(
                        and fraction < config.global_dedup_changed_fraction
                        and tile < config.global_dedup_tile_threshold
                        and patch < config.global_dedup_patch_threshold)
-            checks.append({"time": representative.time, "rms": rms,
+            failed = [name for name, value, threshold in [
+                ("整体差异", rms, config.global_dedup_rms_threshold),
+                ("变化像素比例", fraction, config.global_dedup_changed_fraction),
+                ("局部区域差异", tile, config.global_dedup_tile_threshold),
+                ("细小区域差异", patch, config.global_dedup_patch_threshold)] if value >= threshold]
+            check = {"time": representative.time, "rms": rms,
                            "changed_fraction": fraction, "max_tile_difference": tile,
-                           "max_patch_difference": patch, "highly_similar": bool(similar)})
+                           "max_patch_difference": patch, "highly_similar": bool(similar),
+                           "not_merged_because": failed}
+            checks.append(check)
+            comparisons.append((representative, check))
             if similar:
                 matches.append(representative)
         details = {"scope": "all_final_candidates", "comparisons": checks,
@@ -1043,9 +1052,19 @@ def _final_deduplicate(
                   time_gap_s=abs(candidate.time - representative.time), **details)
         else:
             kept.append(candidate)
-            _note(candidate,
-                  "画面高度相似，但保留任务首尾位置" if matches else "全局检查后保留，未与已选图片高度重复",
-                  matches, **details)
+            if matches:
+                _note(candidate, "画面高度相似，但保留任务首尾位置", matches, **details)
+            elif comparisons:
+                representative, check = min(comparisons, key=lambda pair: max(
+                    pair[1]["rms"] / max(1e-9, config.global_dedup_rms_threshold),
+                    pair[1]["changed_fraction"] / max(1e-9, config.global_dedup_changed_fraction),
+                    pair[1]["max_tile_difference"] / max(1e-9, config.global_dedup_tile_threshold),
+                    pair[1]["max_patch_difference"] / max(1e-9, config.global_dedup_patch_threshold)))
+                _note(candidate, "与最接近画面比较后仍保留：" + "、".join(check["not_merged_because"]),
+                      [representative], closest_time=representative.time,
+                      not_merged_because=check["not_merged_because"], **details)
+            else:
+                _note(candidate, "保留第一张代表画面，后续图片会与它比较", **details)
     # 只与最终确实留下的代表比较，不把 A≈B、B≈C 串联成 A≈C；去重后不补图凑数。
     return sorted(kept, key=lambda c: c.time), sorted(removed, key=lambda c: c.time)
 

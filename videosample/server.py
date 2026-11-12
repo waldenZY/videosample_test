@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
@@ -138,8 +139,8 @@ def import_table(file: UploadFile = File(...)):
         raise HTTPException(422, str(exc)) from exc
     run = {"id": identity, "name": Path(filename).stem,
            "filename": filename, "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-           "version": algorithms.snapshot("base")["algorithm_version"],
-           "algorithm": algorithms.snapshot("base"), "status": "imported",
+           "version": algorithms.snapshot("current")["algorithm_version"],
+           "algorithm": algorithms.snapshot("current"), "run_mode": "current", "status": "imported",
            "warnings": warnings, "errors": errors, "sheet": sheet, "summary": summary,
            "rows": [{"index": index, "item": item, "status": "ready", "message": "等待开始"}
                     for index, item in enumerate(items)]}
@@ -188,6 +189,7 @@ def chain_summaries(run):
 class StartRequest(BaseModel):
     indices: list[int] | None = None
     name: str = ""
+    run_mode: Literal["base", "current", "both"] = "both"
 
 
 @app.post("/api/runs/{identity}/start")
@@ -205,9 +207,9 @@ def start(identity: str, request: StartRequest):
                        message="等待抽帧" if row["index"] in selected else "未勾选")
         run["name"] = request.name.strip() or run["name"]
         run["status"] = "running"
-        experiment_id = uuid.uuid4().hex
-        chain_ids = {"base": identity, "current": experiment_id}
-        run.update(group_id=identity, chain_ids=chain_ids)
+        keys = {"base": ["base"], "current": ["current"], "both": ["base", "current"]}[request.run_mode]
+        chain_ids = {key: identity if index == 0 else uuid.uuid4().hex for index, key in enumerate(keys)}
+        run.update(group_id=identity, chain_ids=chain_ids, run_mode=request.run_mode)
         for key, chain_id in chain_ids.items():
             chain = deepcopy(run)
             chain["id"] = chain_id
@@ -216,8 +218,8 @@ def start(identity: str, request: StartRequest):
             save_run(chain)
             algorithms.save_source(key, run_directory(chain_id))
     for index in indices:
-        POOL.submit(process_row, identity, index)
-        POOL.submit(process_row, experiment_id, index)
+        for chain_id in chain_ids.values():
+            POOL.submit(process_row, chain_id, index)
     return get_run(identity)
 
 
@@ -232,7 +234,8 @@ def copy_run(identity: str):
     run.pop("chain_ids", None)
     run["rows"] = [{"index": row["index"], "item": row["item"], "status": "ready", "message": "等待开始"}
                    for row in run["rows"]]
-    run["algorithm"] = algorithms.snapshot("base")
+    run["run_mode"] = run.get("run_mode", "current")
+    run["algorithm"] = algorithms.snapshot("current" if run["run_mode"] == "current" else "base")
     run["version"] = run["algorithm"]["algorithm_version"]
     with LOCK:
         save_run(run)

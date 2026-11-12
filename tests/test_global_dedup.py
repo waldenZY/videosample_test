@@ -44,8 +44,16 @@ def test_local_text_difference_is_not_merged(tmp_path):
         path = tmp_path / f"text-{index}.png"
         image.save(path)
         candidates.append(media._Candidate(10 + index * 100, path, "4fps"))
-    kept, removed = media._final_deduplicate(candidates, media.KeyframeConfig())
+    with media.record_process(tmp_path / "process"):
+        media._stage("collected", "候选", [], candidates)
+        kept, removed = media._final_deduplicate(candidates, media.KeyframeConfig())
+        media._stage("final", "全局检查", candidates, kept)
     assert kept == candidates and not removed
+    trace = json.loads((tmp_path / "process/trace.json").read_text(encoding="utf-8"))
+    event = trace["frames"][1]["history"][-1]
+    assert event["related"]
+    assert event["details"]["not_merged_because"]
+    assert "仍保留" in event["reason"]
 
 
 def test_similarity_does_not_chain_through_removed_frame(tmp_path):
