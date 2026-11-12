@@ -19,13 +19,14 @@ import tempfile
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
-from numbers import Real
+from functools import lru_cache
+from numbers import Integral, Real
 from pathlib import Path
 
 import numpy as np
 
 
-KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v1"
+KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v2"
 DEFAULT_TASK_START_TIME = 7.0
 
 # 仅供实验台记录过程；不参与任何选帧决策。定稿迁回时可整体移除。
@@ -174,7 +175,7 @@ class KeyframeConfig:
 
     task_start_time: float = DEFAULT_TASK_START_TIME
     task_end_time: float | None = None
-    max_frames: int = 20
+    max_frames: int = 25
     sample_fps: float = 4.0
     scene_threshold: float = 0.02
     scene_min_gap_s: float = 0.15
@@ -193,6 +194,9 @@ class KeyframeConfig:
     final_dedup_rms_threshold: float = 0.008
     final_dedup_changed_fraction_threshold: float = 0.01
     max_edge: int = 720
+    content_rms_threshold: float = 0.025
+    content_changed_fraction: float = 0.06
+    content_tile_threshold: float = 0.06
     # 受保护采样：在开头和结尾两个时间窗口内，每 interval 秒额外标记一帧，
     # 仅当画面高度一致时才去重（用于捕获弹窗/横幅/开场状态等开头结尾的小变化）。
     protected_sample_interval: float = 2.0  # 0 = 禁用；>0 则每 N 秒一帧
@@ -222,8 +226,8 @@ class KeyframeConfig:
             and self.task_end_time <= self.task_start_time
         ):
             raise ValueError("task_end_time 必须大于 task_start_time")
-        if self.max_frames < 2:
-            raise ValueError("max_frames 不能小于 2")
+        if isinstance(self.max_frames, bool) or not isinstance(self.max_frames, Integral) or self.max_frames < 2:
+            raise ValueError("max_frames 必须为不小于 2 的整数")
         if self.sample_fps <= 0:
             raise ValueError("sample_fps 必须大于 0")
         if self.max_edge <= 0:
@@ -246,6 +250,8 @@ class _Candidate:
     source: str
     novelty: float = 0.0
     keep_reason: str = ""
+    support_s: float = 0.0
+    page_id: int = -1
 
 
 def probe_duration(video: Path | str) -> float:
@@ -350,7 +356,7 @@ def _even_sample(times: list[float], count: int) -> list[float]:
 
 def select_keyframe_times(
     video: Path | str,
-    max_frames: int = 20,
+    max_frames: int = 25,
     min_frames: int = 4,
     threshold: float = 0.02,
     min_gap_s: float = 0.15,
@@ -484,11 +490,11 @@ def _content_signature(path: Path) -> np.ndarray:
     from PIL import Image
 
     with Image.open(path) as image:
-        return np.asarray(image.convert("RGB").resize((96, 160)), dtype=np.float32)
+        return np.asarray(image.convert("RGB").resize((96, 160)), dtype=np.uint8)
 
 
 def _content_difference(left: np.ndarray, right: np.ndarray) -> tuple[float, float]:
-    delta = np.abs(left - right)
+    delta = np.abs(left.astype(np.float32) - right.astype(np.float32))
     return (float(np.sqrt(np.mean(delta * delta)) / 255.0),
             float(np.mean(np.any(delta >= 12.0, axis=-1))))
 
@@ -830,152 +836,160 @@ def _infer_task_end_candidate(
     return candidates[best_run[-1]], confidence
 
 
-def _deduplicate_states(
-    candidates: list[_Candidate],
-    config: KeyframeConfig,
-) -> list[_Candidate]:
+def _tile_difference(left, right):
+    delta = np.max(np.abs(left.astype(np.float32) - right.astype(np.float32)), axis=-1) / 255.0
+    # 8×6 个局部区域；同页小卡片变化不会被整张页面的平均值冲淡。
+    return float(delta.reshape(8, 20, 6, 16).mean(axis=(1, 3)).max())
+
+
+def _descriptor(pixels):
+    return pixels.reshape(20, 8, 12, 8, 3).mean(axis=(1, 3)).astype(np.float32) / 255.0
+
+
+def _content_groups(candidates, config):
+    """按实际内容归组，允许少量像素差异，但检查局部变化。"""
+    @lru_cache(maxsize=64)
+    def pixels(path):
+        return _content_signature(Path(path))
+
+    groups = []
+    for candidate in candidates:
+        image = pixels(str(candidate.path))
+        descriptor = _descriptor(image)
+        found = None
+        for group in reversed(groups):
+            if float(np.sqrt(np.mean((descriptor - group["descriptor"]) ** 2))) > config.content_rms_threshold:
+                continue
+            other = pixels(str(group["reference"].path))
+            rms, fraction = _content_difference(image, other)
+            if (rms < config.content_rms_threshold and fraction < config.content_changed_fraction
+                    and _tile_difference(image, other) < config.content_tile_threshold):
+                found = group
+                break
+        if found is None:
+            groups.append({"members": [candidate], "representative": candidate, "reference": candidate,
+                           "descriptor": descriptor, "support": candidate.support_s})
+        else:
+            found["members"].append(candidate)
+            found["support"] += candidate.support_s
+            current = found["representative"]
+            if (candidate.support_s, candidate.time) > (current.support_s, current.time):
+                found["representative"] = candidate
+    return groups
+
+
+def _deduplicate_states(candidates, config):
     if not candidates:
         return []
-    layouts, runs = _build_layout_runs(
-        candidates,
-        config.state_layout_threshold,
-    )
-    stable_runs = {
-        run_index
-        for run_index, run in enumerate(runs)
-        if run_index in {0, len(runs) - 1}
-        or candidates[run[-1]].time - candidates[run[0]].time
-        >= config.stable_min_duration_s
-    }
-
-    selected_indices: set[int] = set()
-    # 受保护帧跳过状态聚类去重，始终保留
-    protected_indices = {
-        i for i, c in enumerate(candidates) if c.source.startswith("protected")
-    }
-    selected_indices.update(protected_indices)
-    for run_index, run in enumerate(runs):
-        first, last = run[0], run[-1]
+    layouts, runs = _build_layout_runs(candidates, config.state_layout_threshold)
+    pages = []
+    selected = []
+    interval = 1.0 / config.sample_fps
+    for index, candidate in enumerate(candidates):
+        candidate.support_s = min(interval, max(0.0, candidates[index + 1].time - candidate.time)) if index + 1 < len(candidates) else interval
+    for run in runs:
+        layout = layouts[run[0]]
+        page = next((i for i, known in enumerate(pages)
+                     if _layout_distance(layout, known) < config.state_layout_threshold), None)
+        if page is None:
+            page = len(pages)
+            pages.append(layout)
         for index in run:
-            _note(candidates[index],
-                  "同一页面中未选为代表" if run_index in stable_runs else "短暂页面只保留代表画面",
-                  [candidates[first], candidates[last]],
-                  run=run_index + 1,
-                  sampled_duration_s=round(candidates[last].time - candidates[first].time, 3),
-                  stable_min_duration_s=config.stable_min_duration_s)
-        if run_index not in stable_runs:
-            representatives = []
-            previous_pixels = None
-            for index in run:
-                pixels = _content_signature(candidates[index].path)
-                rms, fraction = ((1.0, 1.0) if previous_pixels is None else
-                                 _content_difference(previous_pixels, pixels))
-                if (previous_pixels is None or rms >= config.final_dedup_rms_threshold
-                        or fraction >= config.final_dedup_changed_fraction_threshold):
-                    selected_indices.add(index)
-                    candidates[index].keep_reason = "short-state"
-                    _note(candidates[index], "页面虽短暂，但内容不同，保留画面",
-                          [candidates[representatives[-1]]] if representatives else [],
-                          rms=rms, changed_fraction=fraction,
-                          sampled_duration_s=candidates[last].time - candidates[first].time)
-                    representatives.append(index)
-                    previous_pixels = pixels
+            candidates[index].page_id = page
+        groups = _content_groups([candidates[index] for index in run], config)
+        for group in groups:
+            representative = group["representative"]
+            representative.support_s = group["support"]
+            # 首帧不会因选择更晚的重复图而消失；任务结束帧后续仍独立补回。
+            anchors = [c for c in group["members"] if c is candidates[0]]
+            kept = anchors or [representative]
+            for candidate in group["members"]:
+                if candidate in kept:
+                    candidate.keep_reason = "content-state"
+                    _note(candidate, "保留本页这一种内容的代表画面",
+                          page=page + 1, group_size=len(group["members"]), support_s=group["support"])
                 else:
-                    _note(candidates[index], "短暂页面内画面相似，保留已有代表图",
-                          [candidates[representatives[-1]]], rms=rms, changed_fraction=fraction)
-            continue
-
-        selected_indices.add(first)
-        candidates[first].keep_reason = "stable-state-start"
-        if last != first:
-            rms, changed_fraction = _visual_difference(
-                _signature(candidates[first].path),
-                _signature(candidates[last].path),
-            )
-            if (
-                run_index == len(runs) - 1
-                or rms >= 0.020
-                or changed_fraction >= 0.025
-            ):
-                selected_indices.add(last)
-                candidates[last].keep_reason = "stable-state-end"
-
-    for index in selected_indices:
-        candidate = candidates[index]
-        if index in protected_indices:
-            _note(candidate, "位于开头或结尾的保护采样中，本步保留")
-        elif candidate.keep_reason == "stable-state-start":
-            _note(candidate, "保留这一段页面的开始画面")
-        elif candidate.keep_reason == "stable-state-end":
-            _note(candidate, "保留这一段页面的结束画面")
-    return [candidates[index] for index in sorted(selected_indices)]
+                    _note(candidate, "同页内容相近，已由另一张代表画面覆盖", kept,
+                          page=page + 1, group_size=len(group["members"]))
+            selected.extend(kept)
+    return sorted(selected, key=lambda c: c.time)
 
 
-def _limit_candidates(
-    candidates: list[_Candidate],
-    limit: int,
-) -> list[_Candidate]:
+def _merge_repeated_content(candidates, config):
+    """分配数量前先合并重复内容；首尾位置仍保留。"""
+    if not candidates:
+        return []
+    selected = []
+    for group in _content_groups(candidates, config):
+        anchors = [c for c in group["members"] if c is candidates[0] or c.keep_reason in {
+            "task-end-explicit", "task-end-auto", "final-frame"}]
+        kept = anchors or [group["representative"]]
+        for candidate in group["members"]:
+            if candidate in kept:
+                candidate.support_s = group["support"]
+                _note(candidate, "重复出现的相近内容只保留代表或首尾位置",
+                      support_s=group["support"], occurrences=len(group["members"]))
+            else:
+                _note(candidate, "这份内容已在其他时刻保留，合并重复展示", kept,
+                      occurrences=len(group["members"]))
+        selected.extend(kept)
+    return sorted(selected, key=lambda c: c.time)
+
+
+def _limit_candidates(candidates, limit, *, config=None):
+    """内容先归组；优先覆盖不同页面，再分配剩余内容名额。"""
+    if not candidates:
+        return []
+    config = config or KeyframeConfig()
     if len(candidates) <= limit:
+        for candidate in candidates:
+            _note(candidate, "内容代表数量未超过上限，保留", frame_limit=limit)
         return candidates
-    mandatory_indices = {0, len(candidates) - 1}
-    mandatory_indices.update(
-        index
-        for index, candidate in enumerate(candidates)
-        if candidate.keep_reason
-        in {
-            "stable-state-start",
-            "short-state",
-            "transient-local-A-B-A",
-            "task-end-explicit",
-            "task-end-auto",
-            "final-frame",
-        }
-    )
-    # 受保护帧强制保留
-    mandatory_indices.update(
-        index
-        for index, candidate in enumerate(candidates)
-        if candidate.source.startswith("protected")
-    )
-    if len(mandatory_indices) > limit:
-        protected = {
-            index
-            for index in mandatory_indices
-            if index in {0, len(candidates) - 1}
-            or candidates[index].keep_reason
-            in {
-                "transient-local-A-B-A",
-                "short-state",
-                "task-end-explicit",
-                "task-end-auto",
-                "final-frame",
-            }
-            or candidates[index].source.startswith("protected")
-        }
-        remaining = sorted(mandatory_indices - protected)
-        slots = max(0, limit - len(protected))
-        if slots and remaining:
-            positions = np.linspace(0, len(remaining) - 1, slots).round().astype(int)
-            protected.update(remaining[position] for position in positions)
-        mandatory_indices = protected
+    # 只有时间语义上的首尾为固定名额，短页面与定时保护采样不再无限豁免。
+    anchors = [candidates[0]]
+    endings = sorted([c for c in candidates[1:] if c.keep_reason in {
+        "task-end-explicit", "task-end-auto", "final-frame"}],
+        key=lambda c: (c.keep_reason != "final-frame", c.time), reverse=True)
+    anchors.extend(endings[:max(0, limit - 1)])
+    selected = list(dict((id(c), c) for c in anchors).values())
+    pixels = {id(c): _content_signature(c.path) for c in candidates}
 
-    selected = set(mandatory_indices)
-    while len(selected) < limit:
-        remaining = [
-            index for index in range(len(candidates)) if index not in selected
-        ]
-        best = max(
-            remaining,
-            key=lambda index: (
-                min(
-                    abs(candidates[index].time - candidates[kept].time)
-                    for kept in selected
-                ),
-                candidates[index].novelty,
-            ),
-        )
-        selected.add(best)
-    return [candidates[index] for index in sorted(selected)]
+    def distance(left, right):
+        rms, _ = _content_difference(pixels[id(left)], pixels[id(right)])
+        return rms + 0.5 * _tile_difference(pixels[id(left)], pixels[id(right)])
+
+    nearest = {id(c): min(distance(c, other) for other in selected) for c in candidates if c not in selected}
+    decisions = {id(c): "保留任务首帧或结束位置" for c in selected}
+    while len(selected) < min(limit, len(candidates)):
+        remaining = [c for c in candidates if c not in selected]
+        covered = {c.page_id for c in selected}
+        uncovered = [c for c in remaining if c.page_id not in covered]
+        pool = uncovered or remaining
+
+        def score(candidate):
+            same_page = sum(c.page_id == candidate.page_id for c in selected)
+            stability = 0.8 + 0.2 * min(1.0, candidate.support_s / max(0.001, config.stable_min_duration_s))
+            return nearest[id(candidate)] * stability / (1.0 + 0.35 * same_page)
+
+        best = max(pool, key=lambda c: (score(c), c.support_s, c.time))
+        decisions[id(best)] = "为尚未覆盖的页面保留内容代表" if uncovered else "优先保留新增内容较多的画面"
+        selected.append(best)
+        nearest.pop(id(best))
+        for candidate in remaining:
+            if candidate is not best:
+                nearest[id(candidate)] = min(nearest[id(candidate)], distance(candidate, best))
+    selected_ids = {id(c) for c in selected}
+    for candidate in candidates:
+        if id(candidate) in selected_ids:
+            _note(candidate, decisions[id(candidate)], frame_limit=limit, page=candidate.page_id + 1,
+                  support_s=candidate.support_s)
+        else:
+            other = min(selected, key=lambda c: distance(candidate, c))
+            _note(candidate, "内容名额已满，优先覆盖不同页面及差异更大的内容", [other],
+                  frame_limit=limit, page=candidate.page_id + 1,
+                  distance_to_retained=distance(candidate, other),
+                  note="相关图是最相近的已选画面，不表示全部内容都相同或已完整覆盖")
+    return sorted(selected, key=lambda c: c.time)
 
 
 def _final_deduplicate(
@@ -984,9 +998,6 @@ def _final_deduplicate(
 ) -> tuple[list[_Candidate], list[_Candidate]]:
     if not candidates:
         return [], []
-    signatures = {
-        id(candidate): _signature(candidate.path) for candidate in candidates
-    }
     color_signatures = {}
 
     def color_signature(candidate):
@@ -996,13 +1007,9 @@ def _final_deduplicate(
 
     groups: list[list[_Candidate]] = [[candidates[0]]]
     for candidate in candidates[1:]:
-        previous = groups[-1][-1]
-        if previous.keep_reason == "short-state" or candidate.keep_reason == "short-state":
-            rms, changed_fraction = _content_difference(
-                color_signature(previous), color_signature(candidate))
-        else:
-            rms, changed_fraction = _visual_difference(
-                signatures[id(previous)], signatures[id(candidate)])
+        previous = groups[-1][0]
+        rms, changed_fraction = _content_difference(
+            color_signature(previous), color_signature(candidate))
         # 受保护帧使用更严格的去重阈值（仅高度一致时才合并）
         is_any_protected = (
             previous.source.startswith("protected")
@@ -1033,7 +1040,7 @@ def _final_deduplicate(
         "final-frame",
     }
     ordinary_priority = {
-        "short-state": 3,
+        "content-state": 3,
         "transient-local-A-B-A": 3,
         "stable-state-end": 2,
         "stable-state-start": 1,
@@ -1189,15 +1196,10 @@ def _hybrid_keyframes(
     for candidate in forced:
         _note(candidate, "补回任务结束帧" if candidate is task_end_candidate else "保留视频末帧")
     _stage("endpoints", "保留任务首尾", before_forced, combined_ordered)
-    limited = _limit_candidates(
-        combined_ordered,
-        config.max_frames,
-    )
-    for candidate in combined_ordered:
-        if candidate not in limited:
-            _note(candidate, "图片数量筛选时未选中；优先保留保护帧和时间上分散的画面",
-                  limited, target_frames=config.max_frames)
-    _stage("budget", "控制图片数量", combined_ordered, limited)
+    content_unique = _merge_repeated_content(combined_ordered, config)
+    _stage("content", "合并重复内容", combined_ordered, content_unique)
+    limited = _limit_candidates(content_unique, config.max_frames, config=config)
+    _stage("budget", "按内容分配图片名额", content_unique, limited)
     selected, removed = _final_deduplicate(limited, config)
     _stage("final", "最后去重 · 最终结果", limited, selected)
     return selected, removed, effective_task_end, task_end_confidence
@@ -1206,7 +1208,7 @@ def _hybrid_keyframes(
 def extract_scene_keyframes(
     video: Path | str,
     out_dir: Path | str,
-    max_frames: int = 20,
+    max_frames: int = 25,
     min_frames: int = 4,
     threshold: float = 0.02,
     min_gap_s: float = 0.15,
@@ -1333,7 +1335,7 @@ def encode_frame(
 def video_to_frame_urls(
     video: Path | str,
     out_dir: Path | str | None = None,
-    max_frames: int = 20,
+    max_frames: int = 25,
     min_frames: int = 4,
     threshold: float = 0.02,
     min_gap_s: float = 0.15,

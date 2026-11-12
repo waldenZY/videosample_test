@@ -46,8 +46,9 @@ def test_short_distinct_pages_survive_state_filter_and_budget(tmp_path):
                       (10, "black"), (10.2, "gray"), (10.4, "blue"), (11, "white"), (13, "white")])]
     selected = media._deduplicate_states(candidates, media.KeyframeConfig())
     for candidate in candidates[2:5]:
-        assert candidate in selected and candidate.keep_reason == "short-state"
-        assert candidate in media._limit_candidates(selected, 2)
+        assert candidate in selected and candidate.keep_reason == "content-state"
+        assert candidate in media._limit_candidates(selected, len(selected))
+    assert len(media._limit_candidates(selected, 2)) == 2
 
 
 @pytest.mark.parametrize("name,filters,expected_colors", [
@@ -86,7 +87,7 @@ def test_real_video_retains_fast_evidence(tmp_path, name, filters, expected_colo
         assert not any(np.mean(image < 230) > 0.5 for image in old)
     metadata = json.loads((tmp_path / "experiment/keyframes.json").read_text(encoding="utf-8"))
     assert metadata["config"]["sample_fps"] == 4.0
-    assert metadata["algorithm_version"] == "hybrid-state-exp-v1"
+    assert metadata["algorithm_version"] == "hybrid-state-exp-v2"
     assert metadata["selected"][0]["time"] == 7.0
     assert "task-end-explicit" in [row["keep_reason"] for row in metadata["selected"]]
     assert all(row["time"] <= 38 for row in metadata["selected"])
