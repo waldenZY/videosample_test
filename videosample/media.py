@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import base64
+from bisect import bisect_left
+import hashlib
 import io
 import json
 import math
@@ -34,6 +36,7 @@ DEFAULT_TASK_START_TIME = 7.0
 # 仅供实验台记录过程；不参与任何选帧决策。定稿迁回时可整体移除。
 _PROCESS = ContextVar("keyframe_process", default=None)
 _FEATURES = ContextVar("keyframe_features", default=None)
+_FEATURE_KEYS = ContextVar("keyframe_feature_keys", default=None)
 
 
 def _cached_feature(function):
@@ -42,7 +45,21 @@ def _cached_feature(function):
         cache = _FEATURES.get()
         if cache is None:
             return function(path)
-        key = (function.__name__, str(path))
+        identities = _FEATURE_KEYS.get()
+        identity = str(path)
+        if identities is not None:
+            if identity not in identities:
+                try:
+                    # 候选图在单次抽帧中不再改写；字节完全相同的图可以复用同一份特征。
+                    identities[identity] = hashlib.sha256(Path(path).read_bytes()).digest()
+                except OSError:
+                    identities[identity] = identity
+                if len(identities) > 512:
+                    identities.popitem(last=False)
+            else:
+                identities.move_to_end(identity)
+            identity = identities[identity]
+        key = (function.__name__, identity)
         if key not in cache:
             cache[key] = function(path)
             if len(cache) > 512:
@@ -57,10 +74,12 @@ def _with_feature_cache(function):
     @wraps(function)
     def cached(*args, **kwargs):
         token = _FEATURES.set(OrderedDict())
+        identities_token = _FEATURE_KEYS.set(OrderedDict())
         try:
             return function(*args, **kwargs)
         finally:
             _FEATURES.reset(token)
+            _FEATURE_KEYS.reset(identities_token)
     return cached
 
 
@@ -510,6 +529,42 @@ def _extract_at(
     return output.is_file()
 
 
+def _extract_many_at(
+    video: Path, timestamps: list[float], directory: Path, *, max_edge: int,
+) -> dict[float, Path]:
+    """一次解码取多个时刻；仍取三位小数时间点处或其后的第一帧。"""
+    if not timestamps:
+        return {}
+    directory.mkdir(parents=True, exist_ok=True)
+    targets = sorted({float(f"{timestamp:.3f}") for timestamp in timestamps})
+    # prev_pts 是前一输入帧，而非前一选中帧。每个目标只命中跨过它的那一帧。
+    crossings = "+".join(f"gte(t,{target:.3f})*lt(prev_pts*TB,{target:.3f})"
+                         for target in targets)
+    expression = f"if(isnan(prev_pts),gte(t,{targets[0]:.3f}),{crossings})"
+    script = directory / "select.ffscript"
+    script.write_text(f"select='{expression}',showinfo,scale='min({max_edge},iw)':-2", encoding="utf-8")
+    try:
+        process = subprocess.run(
+            [resolve_ffmpeg_executable(), "-y", "-hide_banner", "-i", str(video),
+             "-t", f"{targets[-1] + 1:.3f}", "-an", "-filter_script:v", str(script),
+             "-vsync", "0", "-q:v", "3", str(directory / "batch_%05d.jpg")],
+            check=False, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+        times = [float(value) for value in re.findall(r"pts_time:([0-9.]+)", process.stderr or "")]
+        paths = sorted(directory.glob("batch_*.jpg"))
+        if process.returncode or len(times) != len(paths):
+            return {}
+        result = {}
+        for timestamp in timestamps:
+            target = float(f"{timestamp:.3f}")
+            index = bisect_left(times, target - 1e-6)
+            if index < len(paths):
+                result[timestamp] = paths[index]
+        return result
+    except (OSError, subprocess.SubprocessError):
+        return {}
+
+
 @_cached_feature
 def _signature(path: Path) -> np.ndarray:
     from PIL import Image
@@ -678,11 +733,20 @@ def _extract_candidates(
         ),
         config.scene_min_gap_s,
     )
+    scene_images = _extract_many_at(
+        video, [t for t in scene_times if effective_start <= t <= algorithm_end],
+        output_dir / "scene_batch", max_edge=config.max_edge,
+    )
     for index, timestamp in enumerate(scene_times, start=1):
         if not effective_start <= timestamp <= algorithm_end:
             continue
         path = output_dir / "scenes" / f"scene_{index:04d}_{timestamp:.3f}.jpg"
-        if _extract_at(video, timestamp, path, max_edge=config.max_edge):
+        if timestamp in scene_images:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(scene_images[timestamp], path)
+        elif not _extract_at(video, timestamp, path, max_edge=config.max_edge):
+            continue
+        if path.is_file():
             candidates.append(
                 _Candidate(
                     timestamp,

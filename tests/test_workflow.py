@@ -205,7 +205,8 @@ def test_xlsx_batch_api(tmp_path, monkeypatch, video):
         assert recovered["rows"][0]["status"] == "interrupted"
 
 
-def test_paired_chains_have_independent_steps(tmp_path, monkeypatch, video):
+@pytest.mark.parametrize("limit", [5, 10])
+def test_paired_chains_have_independent_steps(tmp_path, monkeypatch, video, limit):
     monkeypatch.setattr(server, "RUNS", tmp_path / "runs")
 
     class InlinePool:
@@ -228,12 +229,14 @@ def test_paired_chains_have_independent_steps(tmp_path, monkeypatch, video):
                           "task_end_time": 13}, ensure_ascii=False).encode("utf-8")
     with TestClient(server.app) as client:
         base = client.post("/api/import", files={"file": ("input.jsonl", payload)}).json()
-        base = client.post(f"/api/runs/{base['id']}/start", json={}).json()
+        base = client.post(f"/api/runs/{base['id']}/start", json={"experiment_max_frames": limit}).json()
         assert len(base["chains"]) == 2
         other_id = base["chain_ids"]["current"]
         other = client.get(f"/api/runs/{other_id}").json()
         assert base["rows"][0]["status"] == other["rows"][0]["status"] == "done"
         assert base["algorithm"]["key"] == "base" and other["algorithm"]["key"] == "current"
+        assert base["rows"][0]["effective_config"]["max_frames"] == 20
+        assert other["rows"][0]["effective_config"]["max_frames"] == limit
         assert base["rows"][0]["stages"][-1]["id"] == "final"
         assert other["rows"][0]["stages"] == [{"id": "experiment_custom", "title": "实验自定义步骤"}]
         assert (tmp_path / "runs" / base["id"] / "algorithm.py").is_file()

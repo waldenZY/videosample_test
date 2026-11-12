@@ -33,3 +33,26 @@ def test_only_selected_chains_are_submitted_and_mode_survives_copy(tmp_path, mon
         copied = client.post(f"/api/runs/{identity}/copy").json()
         assert copied["run_mode"] == mode and "chain_ids" not in copied
         assert copied["algorithm"]["key"] == keys[0]
+
+
+@pytest.mark.parametrize("limit", [5, 10])
+def test_experiment_limit_is_saved_only_on_experiment_and_survives_rerun(tmp_path, monkeypatch, limit):
+    monkeypatch.setattr(server, "RUNS", tmp_path / "runs")
+    monkeypatch.setattr(server.POOL, "submit", lambda *args: None)
+    payload = json.dumps({"id": "q1", "query": "数量测试", "video_path": "video.mp4"}).encode()
+    with TestClient(server.app) as client:
+        imported = client.post("/api/import", files={"file": ("input.jsonl", payload)}).json()
+        assert imported["experiment_max_frames"] == 10
+        identity = imported["id"]
+        assert client.post(f"/api/runs/{identity}/start",
+                           json={"experiment_max_frames": 25}).status_code == 422
+        started = client.post(f"/api/runs/{identity}/start", json={"run_mode": "both",
+                              "experiment_max_frames": limit}).json()
+        base = server.read_run(started["chain_ids"]["base"])
+        experiment = server.read_run(started["chain_ids"]["current"])
+        assert "overrides" not in base["algorithm"]
+        assert base["algorithm"]["defaults"]["max_frames"] == 20
+        assert experiment["algorithm"]["overrides"] == {"max_frames": limit}
+        assert started["chains"][1]["frame_limit"] == limit
+        copied = client.post(f"/api/runs/{experiment['id']}/copy").json()
+        assert copied["experiment_max_frames"] == limit

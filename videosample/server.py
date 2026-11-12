@@ -142,7 +142,8 @@ def import_table(file: UploadFile = File(...)):
     run = {"id": identity, "name": Path(filename).stem,
            "filename": filename, "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
            "version": algorithms.snapshot("current")["algorithm_version"],
-           "algorithm": algorithms.snapshot("current"), "run_mode": "current", "status": "imported",
+           "algorithm": algorithms.snapshot("current", max_frames=10), "run_mode": "current",
+           "experiment_max_frames": 10, "status": "imported",
            "warnings": warnings, "errors": errors, "sheet": sheet, "summary": summary,
            "rows": [{"index": index, "item": item, "status": "ready", "message": "等待开始"}
                     for index, item in enumerate(items)]}
@@ -207,6 +208,8 @@ def chain_summaries(run):
         result.append({"key": key, "id": identity, "name": "base · 固定链路" if key == "base" else "实验链路",
                        "status": chain["status"], "count": len(chain["rows"]),
                        "version": chain.get("version"), "statistics": chain_statistics(chain),
+                       "frame_limit": (chain.get("algorithm", {}).get("overrides", {}).get("max_frames")
+                                       if key == "current" else None),
                        "done": sum(row["status"] == "done" for row in chain["rows"]),
                        "failed": sum(row["status"] in {"error", "interrupted"} for row in chain["rows"])})
     return result
@@ -216,6 +219,7 @@ class StartRequest(BaseModel):
     indices: list[int] | None = None
     name: str = ""
     run_mode: Literal["base", "current", "both"] = "both"
+    experiment_max_frames: Literal[5, 10] = 10
 
 
 @app.post("/api/runs/{identity}/start")
@@ -235,11 +239,12 @@ def start(identity: str, request: StartRequest):
         run["status"] = "running"
         keys = {"base": ["base"], "current": ["current"], "both": ["base", "current"]}[request.run_mode]
         chain_ids = {key: identity if index == 0 else uuid.uuid4().hex for index, key in enumerate(keys)}
-        run.update(group_id=identity, chain_ids=chain_ids, run_mode=request.run_mode)
+        run.update(group_id=identity, chain_ids=chain_ids, run_mode=request.run_mode,
+                   experiment_max_frames=request.experiment_max_frames)
         for key, chain_id in chain_ids.items():
             chain = deepcopy(run)
             chain["id"] = chain_id
-            chain["algorithm"] = algorithms.snapshot(key)
+            chain["algorithm"] = algorithms.snapshot(key, max_frames=request.experiment_max_frames)
             chain["version"] = chain["algorithm"]["algorithm_version"]
             save_run(chain)
             algorithms.save_source(key, run_directory(chain_id))
@@ -261,7 +266,9 @@ def copy_run(identity: str):
     run["rows"] = [{"index": row["index"], "item": row["item"], "status": "ready", "message": "等待开始"}
                    for row in run["rows"]]
     run["run_mode"] = run.get("run_mode", "current")
-    run["algorithm"] = algorithms.snapshot("current" if run["run_mode"] == "current" else "base")
+    run["experiment_max_frames"] = run.get("experiment_max_frames", 10)
+    run["algorithm"] = algorithms.snapshot("current" if run["run_mode"] == "current" else "base",
+                                           max_frames=run["experiment_max_frames"])
     run["version"] = run["algorithm"]["algorithm_version"]
     with LOCK:
         save_run(run)
@@ -305,6 +312,10 @@ def process_row(identity: str, index: int):
                 raise ValueError("无法读取视频或视频时长为 0")
             kwargs, _, warnings, _ = _operation_timing(item, duration,
                                                   default_start_time=algorithm.DEFAULT_TASK_START_TIME)
+            if run.get("algorithm", {}).get("key") == "current":
+                overrides = run["algorithm"].get("overrides", {})
+                if "max_frames" in overrides:
+                    kwargs["max_frames"] = overrides["max_frames"]
         with measure_phase(timings, "fingerprint"):
             with video.open("rb") as handle:
                 digest = hashlib.sha256()

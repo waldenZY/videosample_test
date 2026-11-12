@@ -21,12 +21,15 @@ def implementation(key):
     return _MODULES[key]
 
 
-def snapshot(key):
+def snapshot(key, *, max_frames=None):
     module = implementation(key)
-    return {"key": key, "name": "base · 原始方法" if key == "base" else "当前实验版",
+    result = {"key": key, "name": "base · 原始方法" if key == "base" else "当前实验版",
             "algorithm_version": module.KEYFRAME_ALGORITHM_VERSION,
             "source_sha256": hashlib.sha256(_SOURCES[key]).hexdigest(),
             "defaults": asdict(module.KeyframeConfig())}
+    if key == "current" and max_frames is not None:
+        result["overrides"] = {"max_frames": max_frames}
+    return result
 
 
 def save_source(key, directory):

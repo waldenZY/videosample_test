@@ -51,6 +51,7 @@ def test_short_distinct_pages_survive_state_filter_and_budget(tmp_path):
     assert len(media._limit_candidates(selected, 2)) == 2
 
 
+@pytest.mark.parametrize("limit", [5, 10])
 @pytest.mark.parametrize("name,filters,expected_colors", [
     ("brief_card", "drawbox=x=35:y=80:w=170:h=12:color=black:t=fill:enable='gte(t,30.1)*lt(t,30.3)'", []),
     ("brief_app", "drawbox=x=0:y=0:w=240:h=400:color=gray:t=fill:enable='gte(t,30.1)*lt(t,30.4)'", ["gray"]),
@@ -59,14 +60,16 @@ def test_short_distinct_pages_survive_state_filter_and_budget(tmp_path):
         "drawbox=x=0:y=0:w=240:h=400:color=green:t=fill:enable='gte(t,30.4)*lt(t,30.7)'",
         "drawbox=x=0:y=0:w=240:h=400:color=blue:t=fill:enable='gte(t,30.7)*lt(t,31.0)'"]), ["red", "green", "blue"]),
 ])
-def test_real_video_retains_fast_evidence(tmp_path, name, filters, expected_colors):
+def test_real_video_retains_fast_evidence(tmp_path, name, filters, expected_colors, limit):
     video = tmp_path / f"{name}.mp4"
     subprocess.run([media.resolve_ffmpeg_executable(), "-y", "-v", "error", "-f", "lavfi", "-i",
                     "color=c=white:s=240x400:r=30:d=40", "-vf", filters,
                     "-c:v", "mpeg4", "-q:v", "2", str(video)], check=True, timeout=30)
     base = base_media.extract_scene_keyframes(video, tmp_path / "base", task_end_time=38)
     with media.record_process(tmp_path / "process"):
-        experiment = media.extract_scene_keyframes(video, tmp_path / "experiment", task_end_time=38)
+        experiment = media.extract_scene_keyframes(video, tmp_path / "experiment", task_end_time=38,
+                                                   max_frames=limit)
+    assert len(experiment) <= limit
 
     def content(paths):
         return [np.asarray(Image.open(path).convert("RGB")) for path in paths]

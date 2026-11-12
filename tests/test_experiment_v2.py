@@ -88,21 +88,23 @@ def test_end_positions_share_the_same_budget(tmp_path, limit):
     assert candidates[0] in selected and candidates[-2] in selected
 
 
-def test_long_animated_video_stays_within_25_and_trace_explains_selection(tmp_path):
+@pytest.mark.parametrize("limit", [5, 10, 25])
+def test_long_animated_video_stays_within_limit_and_trace_explains_selection(tmp_path, limit):
     video = tmp_path / "animated.mp4"
     subprocess.run([media.resolve_ffmpeg_executable(), "-y", "-v", "error", "-f", "lavfi", "-i",
                     "testsrc2=size=120x200:rate=12:duration=40", "-c:v", "mpeg4", "-q:v", "3", str(video)],
                    check=True, timeout=30)
     with media.record_process(tmp_path / "process"):
-        frames = media.extract_scene_keyframes(video, tmp_path / "final", task_start_time=0, task_end_time=38)
-    assert 2 <= len(frames) <= 25
+        frames = media.extract_scene_keyframes(video, tmp_path / "final", task_start_time=0, task_end_time=38,
+                                              max_frames=limit)
+    assert 2 <= len(frames) <= limit
     trace = json.loads((tmp_path / "process/trace.json").read_text(encoding="utf-8"))
     assert len(trace["frames"]) > 100
     assert any(stage["id"] == "content" for stage in trace["stages"])
     budget = next(stage for stage in trace["stages"] if stage["id"] == "budget")
-    assert len(budget["output_ids"]) <= 25
+    assert len(budget["output_ids"]) <= limit
     assert any(event["status"] == "dropped" and event["related"] for event in budget["events"])
     metadata = json.loads((tmp_path / "final/keyframes.json").read_text(encoding="utf-8"))
     assert metadata["algorithm_version"] == "hybrid-state-exp-v3"
-    assert metadata["config"]["max_frames"] == 25
+    assert metadata["config"]["max_frames"] == limit
     assert base_media.KeyframeConfig().max_frames == 20
