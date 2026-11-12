@@ -19,6 +19,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import media
+from . import algorithms
+from .comparison import compare_runs
 from .download import download_remote_video, is_remote_video_url
 from .preparation import _operation_timing, resolve_operation_video_path
 from .table_dataset import convert_table
@@ -102,6 +104,23 @@ def health():
         return {"ok": False, "ffmpeg": False, "error": str(exc)}
 
 
+@app.get("/api/algorithms")
+def list_algorithms():
+    return [algorithms.snapshot(key) for key in ("base", "current")]
+
+
+@app.get("/api/compare")
+def comparison(left: str, right: str):
+    if left == right:
+        raise HTTPException(422, "请选择两次不同的运行")
+
+    def saved_trace(identity, index):
+        path = run_directory(identity) / "items" / f"{index:05d}" / "process" / "trace.json"
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    return compare_runs(read_run(left), read_run(right), saved_trace)
+
+
 @app.post("/api/import")
 def import_table(file: UploadFile = File(...)):
     filename = Path((file.filename or "dataset.xlsx").replace("\\", "/")).name
@@ -134,7 +153,8 @@ def import_table(file: UploadFile = File(...)):
         raise HTTPException(422, str(exc)) from exc
     run = {"id": identity, "name": Path(filename).stem,
            "filename": filename, "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-           "version": media.KEYFRAME_ALGORITHM_VERSION, "status": "imported",
+           "version": algorithms.snapshot("base")["algorithm_version"],
+           "algorithm": algorithms.snapshot("base"), "status": "imported",
            "warnings": warnings, "errors": errors, "sheet": sheet, "summary": summary,
            "rows": [{"index": index, "item": item, "status": "ready", "message": "等待开始"}
                     for index, item in enumerate(items)]}
@@ -151,6 +171,7 @@ def list_runs():
             run = read_run(path.parent.name)
             result.append({key: run[key] for key in ("id", "name", "status", "created_at", "version")}
                           | {"count": len(run["rows"]),
+                             "algorithm": run.get("algorithm"),
                              "done": sum(row["status"] == "done" for row in run["rows"])})
         except (OSError, ValueError, HTTPException):
             continue
@@ -165,10 +186,15 @@ def get_run(identity: str):
 class StartRequest(BaseModel):
     indices: list[int] | None = None
     name: str = ""
+    algorithm: str = "base"
 
 
 @app.post("/api/runs/{identity}/start")
 def start(identity: str, request: StartRequest):
+    try:
+        algorithm_snapshot = algorithms.snapshot(request.algorithm)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
     with LOCK:
         run = read_run(identity)
         if run["status"] != "imported":
@@ -181,6 +207,9 @@ def start(identity: str, request: StartRequest):
             row.update(status="queued" if row["index"] in selected else "skipped",
                        message="等待抽帧" if row["index"] in selected else "未勾选")
         run["name"] = request.name.strip() or run["name"]
+        run["algorithm"] = algorithm_snapshot
+        run["version"] = algorithm_snapshot["algorithm_version"]
+        algorithms.save_source(request.algorithm, run_directory(identity))
         run["status"] = "running"
         save_run(run)
     for index in indices:
@@ -197,7 +226,8 @@ def copy_run(identity: str):
     run["status"] = "imported"
     run["rows"] = [{"index": row["index"], "item": row["item"], "status": "ready", "message": "等待开始"}
                    for row in run["rows"]]
-    run["version"] = media.KEYFRAME_ALGORITHM_VERSION
+    run["algorithm"] = algorithms.snapshot(run.get("algorithm", {}).get("key", "base"))
+    run["version"] = run["algorithm"]["algorithm_version"]
     with LOCK:
         save_run(run)
     return run
@@ -209,6 +239,8 @@ def process_row(identity: str, index: int):
     directory.mkdir(parents=True, exist_ok=True)
     item = read_run(identity)["rows"][index]["item"]
     try:
+        run = read_run(identity)
+        algorithm = algorithms.implementation(run.get("algorithm", {}).get("key", "base"))
         update_row(identity, index, status="running", message="正在准备视频")
         raw = item["video_path"]
         if is_remote_video_url(raw):
@@ -217,22 +249,25 @@ def process_row(identity: str, index: int):
         else:
             video = resolve_operation_video_path(raw, base_dir=ROOT)
         (directory / "video_ref.json").write_text(json.dumps({"path": str(video)}, ensure_ascii=False), encoding="utf-8")
-        duration = media.probe_duration(video)
+        duration = algorithm.probe_duration(video)
         if duration <= 0:
             raise ValueError("无法读取视频或视频时长为 0")
-        kwargs, _, warnings, _ = _operation_timing(item, duration)
+        kwargs, _, warnings, _ = _operation_timing(item, duration,
+                                                  default_start_time=algorithm.DEFAULT_TASK_START_TIME)
         with video.open("rb") as handle:
             digest = hashlib.sha256()
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
         update_row(identity, index, message="正在抽帧并记录处理过程", duration=duration,
                    warnings=warnings, video_sha256=digest.hexdigest())
-        with media.record_process(directory / "process") as recorder:
-            frames = media.extract_scene_keyframes(video, directory / "final", **kwargs)
+        with algorithm.record_process(directory / "process") as recorder:
+            frames = algorithm.extract_scene_keyframes(video, directory / "final", **kwargs)
         if not frames:
             raise ValueError("视频未能抽出有效图片，请检查视频与任务时间范围")
         counts = {stage["id"]: len(stage["output_ids"]) for stage in recorder.stages}
+        metadata = json.loads((directory / "final" / "keyframes.json").read_text(encoding="utf-8"))
         update_row(identity, index, status="done", message="抽帧完成", frame_count=len(frames),
+                   effective_config=metadata["config"],
                    stage_counts=counts, elapsed_s=round(time.monotonic() - started, 2))
     except Exception as exc:
         update_row(identity, index, status="error", message="本题失败", error=str(exc),

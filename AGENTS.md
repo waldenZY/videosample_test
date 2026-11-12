@@ -3,6 +3,8 @@
 - 如果使用 Python 环境，使用 `moto` 环境。
 - 沟通和界面文案用简单中文，优先用实际画面解释处理原因。
 - `reference/media.py` 是原始算法副本，不直接修改。来源见 `reference/source.json`。
+- `videosample/versions/base_media.py` 和 `base.json` 是固定 base，不修改；后续抽帧实验改 videosample/media.py，保持 base 与实验版可以独立运行。
+- 每次运行保存所用代码、默认参数与每题实际配置；比较按样本对齐，并提示视频内容或任务时间范围不同的情况。
 - 增加过程记录时，不改变原始版本的选帧顺序、时间窗、保留决策和最终图片。
 - 抽帧方法变更保存为新版本，并通过相同视频与原始版本比较。
 - 输入和抽帧前处理复制或参考 auto_eval_agent；同一份输入保持相同处理结果，不要求用户改表。

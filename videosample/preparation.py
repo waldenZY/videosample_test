@@ -59,6 +59,8 @@ def resolve_operation_video_path(
 def _operation_timing(
     item: dict,
     duration: float,
+    *,
+    default_start_time: float = DEFAULT_TASK_START_TIME,
 ) -> tuple[dict[str, float], str, list[str], set[str]]:
     """校验任务起止时间，并生成抽帧参数、缓存键及回退警告。"""
     supplied: dict[str, float] = {}
@@ -85,7 +87,7 @@ def _operation_timing(
             continue
         supplied[field] = normalized
 
-    effective_start = supplied.get("task_start_time", DEFAULT_TASK_START_TIME)
+    effective_start = supplied.get("task_start_time", default_start_time)
     task_end = supplied.get("task_end_time")
     if task_end is not None and task_end <= effective_start:
         raise ValueError("task_end_time 必须大于 task_start_time")

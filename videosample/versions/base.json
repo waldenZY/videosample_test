@@ -1,0 +1,7 @@
+{
+  "name": "base",
+  "algorithm_version": "hybrid-state-v3.2.0",
+  "source_commit": "45dd11a1b8603b76989276d59dfdcb94bffc42b5",
+  "sha256": "c6e9f8069081abceee7db31f0ec3820d2f61caca8fc53a4e200d9fb3f2cc3013",
+  "note": "Frozen auto_eval baseline with observation-only process recording. Do not edit."
+}

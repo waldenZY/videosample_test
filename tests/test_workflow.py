@@ -14,7 +14,8 @@ import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
-from videosample import media, server
+from videosample import algorithms, media, server
+from videosample.versions import base_media
 from videosample.preparation import _operation_timing, resolve_operation_video_path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -69,6 +70,23 @@ def test_plain_extraction_has_no_process_outputs(tmp_path, video):
     media.extract_scene_keyframes(video, out, task_end_time=13)
     assert not (out / "trace.json").exists()
     assert not (out / "candidates").exists()
+
+
+def test_base_defaults_and_output_match_original(tmp_path, video, baseline):
+    assert asdict(base_media.KeyframeConfig()) == asdict(baseline.KeyframeConfig())
+    original = baseline.extract_scene_keyframes(video, tmp_path / "old", task_end_time=13)
+    with base_media.record_process(tmp_path / "base-process"):
+        frozen = base_media.extract_scene_keyframes(video, tmp_path / "base", task_end_time=13)
+    assert [p.read_bytes() for p in original] == [p.read_bytes() for p in frozen]
+    assert json.loads((tmp_path / "old/keyframes.json").read_text(encoding="utf-8")) == json.loads(
+        (tmp_path / "base/keyframes.json").read_text(encoding="utf-8"))
+
+
+def test_base_stays_separate_from_experiment(monkeypatch):
+    expected = algorithms.snapshot("base")
+    monkeypatch.setattr(media, "KEYFRAME_ALGORITHM_VERSION", "experiment-test")
+    assert algorithms.snapshot("base") == expected
+    assert algorithms.snapshot("current")["algorithm_version"] == "experiment-test"
 
 
 def test_out_of_range_times_keep_auto_eval_fallback():
@@ -183,3 +201,53 @@ def test_xlsx_batch_api(tmp_path, monkeypatch, video):
         recovered = client.get(f"/api/runs/{identity}").json()
         assert recovered["status"] == "interrupted"
         assert recovered["rows"][0]["status"] == "interrupted"
+
+
+def test_base_experiment_and_comparison(tmp_path, monkeypatch, video):
+    monkeypatch.setattr(server, "RUNS", tmp_path / "runs")
+
+    class InlinePool:
+        def submit(self, fn, *args):
+            fn(*args)
+
+    monkeypatch.setattr(server, "POOL", InlinePool())
+    called = []
+    extract = media.extract_scene_keyframes
+
+    def experiment(*args, **kwargs):
+        called.append(True)
+        return extract(*args, **kwargs)
+
+    monkeypatch.setattr(media, "extract_scene_keyframes", experiment)
+    payload = json.dumps({"id": "same", "query": "比较同一视频", "video_path": str(video),
+                          "task_end_time": 13}, ensure_ascii=False).encode("utf-8")
+    with TestClient(server.app) as client:
+        assert len(client.get("/api/algorithms").json()) == 2
+        base = client.post("/api/import", files={"file": ("input.jsonl", payload)}).json()
+        base = client.post(f"/api/runs/{base['id']}/start", json={}).json()
+        assert base["algorithm"]["key"] == "base" and not called
+        assert (tmp_path / "runs" / base["id"] / "algorithm.py").is_file()
+        assert base["rows"][0]["effective_config"]["sample_fps"] == 1.0
+        other = client.post(f"/api/runs/{base['id']}/copy").json()
+        assert client.post(f"/api/runs/{other['id']}/start", json={"algorithm": "bad"}).status_code == 422
+        other = client.post(f"/api/runs/{other['id']}/start", json={"algorithm": "current"}).json()
+        assert other["algorithm"]["key"] == "current" and called
+        url = f"/api/compare?left={base['id']}&right={other['id']}"
+        compared = client.get(url).json()
+        row = compared["rows"][0]
+        assert row["comparable"] and not row["notices"]
+        assert len(row["left"]["frames"]) == len(row["right"]["frames"])
+        assert len(row["left"]["stages"]) == 7
+        assert client.get(row["left"]["frames"][0]["image_url"]).status_code == 200
+        assert client.get(f"/api/compare?left={base['id']}&right={base['id']}").status_code == 422
+        other["rows"][0]["video_sha256"] = "changed"
+        server.save_run(other)
+        row = client.get(url).json()["rows"][0]
+        assert not row["comparable"] and any("视频内容不同" in notice for notice in row["notices"])
+        other["rows"][0]["video_sha256"] = base["rows"][0]["video_sha256"]
+        other["rows"][0]["effective_config"]["task_end_time"] = 14
+        server.save_run(other)
+        assert any("时间范围不同" in notice for notice in client.get(url).json()["rows"][0]["notices"])
+        other["rows"] = []
+        server.save_run(other)
+        assert client.get(url).json()["rows"][0]["right"] is None
