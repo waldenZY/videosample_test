@@ -31,14 +31,16 @@ from pathlib import Path
 import numpy as np
 
 
-KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4.4"
+KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4.5"
 DEFAULT_TASK_START_TIME = 7.0
+DEFAULT_ANALYSIS_MASK_BOX = (.63, .005, .74, .040)
 
 # 仅供实验台记录过程；不参与任何选帧决策。定稿迁回时可整体移除。
 _PROCESS = ContextVar("keyframe_process", default=None)
 _FEATURES = ContextVar("keyframe_features", default=None)
 _FEATURE_KEYS = ContextVar("keyframe_feature_keys", default=None)
 _SMALL_FEATURES = ContextVar("keyframe_small_features", default=None)
+_ANALYSIS_MASK = ContextVar("keyframe_analysis_mask", default=DEFAULT_ANALYSIS_MASK_BOX)
 
 
 def _cached_feature(function):
@@ -83,12 +85,15 @@ def _with_feature_cache(function):
         token = _FEATURES.set(OrderedDict())
         identities_token = _FEATURE_KEYS.set(OrderedDict())
         small_token = _SMALL_FEATURES.set(OrderedDict())
+        config = kwargs.get('config') or (args[2] if len(args) > 2 else None)
+        mask_token = _ANALYSIS_MASK.set(getattr(config, 'analysis_mask_box', _ANALYSIS_MASK.get()))
         try:
             return function(*args, **kwargs)
         finally:
             _FEATURES.reset(token)
             _FEATURE_KEYS.reset(identities_token)
             _SMALL_FEATURES.reset(small_token)
+            _ANALYSIS_MASK.reset(mask_token)
     return cached
 
 
@@ -111,10 +116,15 @@ def _prewarm_features(candidates, function):
         paths.append(path)
     if not paths:
         return
+    mask_box = _ANALYSIS_MASK.get()
     def load(path):
         payload = path.read_bytes()
         digest = hashlib.sha256(payload).digest()
-        value = function.__wrapped__(io.BytesIO(payload))
+        mask_token = _ANALYSIS_MASK.set(mask_box)
+        try:
+            value = function.__wrapped__(io.BytesIO(payload))
+        finally:
+            _ANALYSIS_MASK.reset(mask_token)
         return path, digest, value
     worker_count = min(8, max(1, (os.cpu_count() or 2) // 2))
     with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix='frame-feature') as workers:
@@ -337,6 +347,7 @@ class KeyframeConfig:
     local_analysis_max_edge: int = 320
     local_template_threshold: float = 0.90
     local_content_bin_height: int = 24
+    analysis_mask_box: tuple | None = DEFAULT_ANALYSIS_MASK_BOX
     # 受保护采样：在开头和结尾两个时间窗口内，每 interval 秒额外标记一帧，
     # 仅当画面高度一致时才去重（用于捕获弹窗/横幅/开场状态等开头结尾的小变化）。
     protected_sample_interval: float = 2.0  # 0 = 禁用；>0 则每 N 秒一帧
@@ -374,6 +385,13 @@ class KeyframeConfig:
             raise ValueError("局部匹配阈值必须在 0 到 1 之间")
         if self.sample_fps <= 0:
             raise ValueError("sample_fps 必须大于 0")
+        if self.analysis_mask_box is not None:
+            box = self.analysis_mask_box
+            if (not isinstance(box, (tuple, list)) or len(box) != 4
+                    or not all(isinstance(v, Real) and math.isfinite(v) for v in box)
+                    or not 0 <= box[0] < box[2] <= 1 or not 0 <= box[1] < box[3] <= 1):
+                raise ValueError("分析遮挡区域必须为 0 到 1 的左、上、右、下坐标，或 None")
+            object.__setattr__(self, 'analysis_mask_box', tuple(box))
         if self.max_edge <= 0:
             raise ValueError("max_edge 必须大于 0")
         if (
@@ -456,11 +474,14 @@ def scene_change_times(
     command = [resolve_ffmpeg_executable(), "-hide_banner", "-i", str(video)]
     if end_time is not None:
         command.extend(["-t", f"{end_time:.3f}"])
+    box = _ANALYSIS_MASK.get()
+    mask_filter = (f'drawbox=x=iw*{box[0]}:y=ih*{box[1]}:'
+                   f'w=iw*{box[2] - box[0]}:h=ih*{box[3] - box[1]}:color=black:t=fill,') if box else ''
     command.extend(
         [
             "-an",
             "-vf",
-            f"select='gt(scene,{threshold})',showinfo",
+            f"{mask_filter}select='gt(scene,{threshold})',showinfo",
             "-f",
             "null",
             "-",
@@ -630,11 +651,21 @@ def _extract_many_at(
         return {}
 
 
+def _masked_analysis_image(image, box):
+    """只修改 convert 生成的内存副本，不改变候选和最终输出图片。"""
+    if box is not None:
+        width, height = image.size
+        x0, y0, x1, y1 = box
+        image.paste(0, (round(x0 * width), round(y0 * height), round(x1 * width), round(y1 * height)))
+    return image
+
+
 @_cached_feature
 def _signature(path: Path) -> np.ndarray:
     from PIL import Image
 
-    image = Image.open(path).convert("L").resize((96, 160))
+    with Image.open(path) as original:
+        image = _masked_analysis_image(original.convert('L'), _ANALYSIS_MASK.get()).resize((96, 160))
     array = np.asarray(image, dtype=np.float32)
     return array[12:154, :]
 
@@ -643,7 +674,8 @@ def _signature(path: Path) -> np.ndarray:
 def _layout_signature(path: Path) -> np.ndarray:
     from PIL import Image, ImageFilter
 
-    image = Image.open(path).convert("L")
+    with Image.open(path) as original:
+        image = _masked_analysis_image(original.convert('L'), _ANALYSIS_MASK.get())
     image = image.filter(ImageFilter.GaussianBlur(radius=12)).resize((16, 27))
     array = np.asarray(image, dtype=np.float32)
     return array[2:-1, :]
@@ -653,7 +685,8 @@ def _layout_signature(path: Path) -> np.ndarray:
 def _assistant_shell_signature(path: Path) -> np.ndarray:
     from PIL import Image, ImageFilter
 
-    image = Image.open(path).convert("L")
+    with Image.open(path) as original:
+        image = _masked_analysis_image(original.convert('L'), _ANALYSIS_MASK.get())
     image = image.filter(ImageFilter.GaussianBlur(radius=8)).resize((32, 54))
     array = np.asarray(image, dtype=np.float32)
     return array[-8:-2, :]
@@ -675,7 +708,7 @@ def _content_signature(path: Path) -> np.ndarray:
     from PIL import Image
 
     with Image.open(path) as image:
-        return np.asarray(image.convert("RGB").resize((96, 160)), dtype=np.uint8)
+        return np.asarray(_masked_analysis_image(image.convert('RGB'), _ANALYSIS_MASK.get()).resize((96, 160)), dtype=np.uint8)
 
 
 def _content_difference(left: np.ndarray, right: np.ndarray) -> tuple[float, float]:
@@ -1356,7 +1389,7 @@ def _local_views(candidates, config, fingerprints):
         if digest in fingerprints:
             return candidate, digest, None, None, None, None
         with Image.open(io.BytesIO(payload) if payload is not None else candidate.path) as image:
-            source = np.asarray(image.convert('RGB'))
+            source = np.asarray(_masked_analysis_image(image.convert('RGB'), config.analysis_mask_box))
         height, width = source.shape[:2]
         scale = min(1.0, config.local_analysis_max_edge / max(height, width))
         small = cv.resize(source, (max(8, round(width * scale)), max(8, round(height * scale))),

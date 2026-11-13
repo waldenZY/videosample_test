@@ -58,7 +58,8 @@ def test_image_features_are_reused_only_within_one_extraction(tmp_path):
     original = read()
     Image.new("RGB", (96, 160), "black").save(path)
     changed = read()
-    assert original.mean() == 255 and changed.mean() == 0
+    # 固定布局 mask 会填黑顶部小框，框外的白色仍须更新为新文件的黑色。
+    assert original[80, 48].mean() == 255 and changed.mean() == 0
     assert media._FEATURES.get() is None
     assert media._FEATURE_KEYS.get() is None
 

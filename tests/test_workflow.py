@@ -81,6 +81,9 @@ def test_adaptive_selection_is_output_without_another_filter(tmp_path, video):
     metadata = json.loads((tmp_path / 'final/keyframes.json').read_text(encoding='utf-8'))
     assert metadata['selection']['selected_count'] == len(frames)
     assert 'final_dedup_removed' not in metadata
+    assert metadata['config']['analysis_mask_box'] == list(media.DEFAULT_ANALYSIS_MASK_BOX)
+    for path, identity in zip(frames, recorder.stages[-1]['output_ids']):
+        assert path.read_bytes() == (tmp_path / 'process/candidates' / f'{identity}.jpg').read_bytes()
 
 
 def test_merged_candidates_are_not_restored_by_later_stages(tmp_path, video, monkeypatch):

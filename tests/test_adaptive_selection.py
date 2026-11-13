@@ -36,7 +36,8 @@ def shot(tmp_path, name, time, content=None, y=110, color='#b8c2cc', end=False):
 
 
 def select(candidates, limit=15):
-    config = media.KeyframeConfig()
+    # 这些纯画布没有录屏状态栏，卡片可以滑到任意边缘；不套用固定布局遮挡。
+    config = media.KeyframeConfig(analysis_mask_box=None)
     analysis = media._analyze_local_content(candidates, config)
     selected = media._limit_candidates(candidates, limit, config=config, analysis=analysis)
     return selected, analysis

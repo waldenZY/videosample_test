@@ -21,7 +21,8 @@ def test_repeat_is_covered_across_other_pages_and_large_time_gap(tmp_path):
 def test_small_encoding_difference_does_not_add_an_output(tmp_path):
     frames = [frame(tmp_path, 'start', 0, 'white'), frame(tmp_path, 'a', 10, (40, 40, 40), 2),
               frame(tmp_path, 'other', 20, 'blue'), frame(tmp_path, 'b', 80, (41, 41, 41))]
-    selected = media._limit_candidates(frames, 15)
+    # 均匀色块用于测试编码误差，不具有约定的录屏状态栏布局。
+    selected = media._limit_candidates(frames, 15, config=media.KeyframeConfig(analysis_mask_box=None))
     assert frames[1] in selected and frames[3] not in selected
 
 
