@@ -72,6 +72,17 @@ def test_plain_extraction_has_no_process_outputs(tmp_path, video):
     assert not (out / "candidates").exists()
 
 
+def test_adaptive_selection_is_output_without_another_filter(tmp_path, video):
+    with media.record_process(tmp_path / 'process') as recorder:
+        frames = media.extract_scene_keyframes(video, tmp_path / 'final', task_end_time=13)
+    assert recorder.stages[-1]['id'] == 'budget'
+    assert len(recorder.stages[-1]['output_ids']) == len(frames)
+    assert all(stage['id'] != 'final' for stage in recorder.stages)
+    metadata = json.loads((tmp_path / 'final/keyframes.json').read_text(encoding='utf-8'))
+    assert metadata['selection']['selected_count'] == len(frames)
+    assert 'final_dedup_removed' not in metadata
+
+
 def test_base_defaults_and_output_match_original(tmp_path, video, baseline):
     assert asdict(base_media.KeyframeConfig()) == asdict(baseline.KeyframeConfig())
     original = baseline.extract_scene_keyframes(video, tmp_path / "old", task_end_time=13)
@@ -238,7 +249,7 @@ def test_paired_chains_have_independent_steps(tmp_path, monkeypatch, video, limi
         assert base["rows"][0]["effective_config"]["max_frames"] == 20
         assert other["rows"][0]["effective_config"]["max_frames"] == limit
         assert other['rows'][0]['selection']['policy'] == 'adaptive-local-v1'
-        assert other['rows'][0]['selection']['selected_after_dedup'] == other['rows'][0]['frame_count']
+        assert other['rows'][0]['selection']['selected_count'] == other['rows'][0]['frame_count']
         trace = client.get(f"/api/runs/{other_id}/items/0/trace").json()
         assert trace['selection'] == other['rows'][0]['selection']
         assert base["rows"][0]["stages"][-1]["id"] == "final"

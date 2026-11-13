@@ -1,7 +1,7 @@
 """任务类（录屏）的混合关键帧抽取与帧编码。
 
-流程：固定频率采样 + scene 候选 → UI 状态聚类 → 短暂弹窗保护 →
-任务结束点判断 → 强制首帧/任务结束帧（无显式结束点时保留视频末帧）→ 最终严格去重。
+流程：固定频率与变化取图 → 原有时间/内容筛选 → 疑似误合并复核 →
+局部内容与代表图检查 → 按新增内容自适应输出。
 
 FFmpeg 取图，Pillow/NumPy 比较；OpenCV 仅用于最后选图的局部检查。
 """
@@ -31,7 +31,7 @@ from pathlib import Path
 import numpy as np
 
 
-KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4"
+KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4.1"
 DEFAULT_TASK_START_TIME = 7.0
 
 # 仅供实验台记录过程；不参与任何选帧决策。定稿迁回时可整体移除。
@@ -1619,7 +1619,7 @@ def _limit_candidates(candidates, limit, *, config=None, analysis=None):
                         'uncovered_count': len(uncovered),
                         'uncertain_content_count': len(uncertain),
                         'uncovered_content': [analysis.units[key] for key in sorted(uncovered)],
-                        'selected_before_dedup': len(selected)}
+                        'selected_count': len(selected)}
     for candidate in candidates:
         identity = id(candidate)
         missing = analysis.coverage[identity] - covered
@@ -1643,91 +1643,13 @@ def _limit_candidates(candidates, limit, *, config=None, analysis=None):
     return sorted(selected, key=lambda c: c.time)
 
 
-def _final_deduplicate(
-    candidates: list[_Candidate],
-    config: KeyframeConfig,
-) -> tuple[list[_Candidate], list[_Candidate]]:
-    """跨全部最终候选检查高度重复，不受相邻关系或时间间隔限制。"""
-    if not candidates:
-        return [], []
-    signatures = {id(c): _content_signature(c.path) for c in candidates}
-    first = min(candidates, key=lambda c: c.time)
-    endpoints = {id(c) for c in candidates if c is first or c.keep_reason in {
-        "task-end-explicit", "task-end-auto", "final-frame"}}
-    # 首尾先确定；其他图片优先选择停留更充分的代表，不按时间顺序截断。
-    ordered = sorted([c for c in candidates if id(c) in endpoints], key=lambda c: c.time)
-    ordered += sorted([c for c in candidates if id(c) not in endpoints],
-                      key=lambda c: (c.support_s, c.novelty, c.time), reverse=True)
-    kept, removed = [], []
-    for candidate in ordered:
-        image = signatures[id(candidate)]
-        matches = []
-        checks = []
-        comparisons = []
-        for representative in kept:
-            other = signatures[id(representative)]
-            rms, fraction = _content_difference(image, other)
-            tile = _tile_difference(image, other)
-            delta = np.max(np.abs(image.astype(np.float32) - other.astype(np.float32)), axis=-1) / 255.0
-            patch = float(delta.reshape(40, 4, 24, 4).mean(axis=(1, 3)).max())
-            similar = (rms < config.global_dedup_rms_threshold
-                       and fraction < config.global_dedup_changed_fraction
-                       and tile < config.global_dedup_tile_threshold
-                       and patch < config.global_dedup_patch_threshold)
-            failed = [name for name, value, threshold in [
-                ("整体差异", rms, config.global_dedup_rms_threshold),
-                ("变化像素比例", fraction, config.global_dedup_changed_fraction),
-                ("局部区域差异", tile, config.global_dedup_tile_threshold),
-                ("细小区域差异", patch, config.global_dedup_patch_threshold)] if value >= threshold]
-            check = {"time": representative.time, "rms": rms,
-                           "changed_fraction": fraction, "max_tile_difference": tile,
-                           "max_patch_difference": patch, "highly_similar": bool(similar),
-                           "not_merged_because": failed}
-            checks.append(check)
-            comparisons.append((representative, check))
-            different_evidence = (bool(candidate.evidence_ids)
-                                  and not set(candidate.evidence_ids) <= set(representative.evidence_ids))
-            if similar and different_evidence:
-                check['different_local_evidence'] = True
-                check['not_merged_because'].append('包含不同的局部内容或互补范围')
-            if similar and not different_evidence:
-                matches.append(representative)
-        details = {"scope": "all_final_candidates", "comparisons": checks,
-                   "rms_threshold": config.global_dedup_rms_threshold,
-                   "changed_fraction_threshold": config.global_dedup_changed_fraction,
-                   "tile_threshold": config.global_dedup_tile_threshold,
-                   "patch_threshold": config.global_dedup_patch_threshold}
-        if matches and id(candidate) not in endpoints:
-            representative = min(matches, key=lambda c: _content_difference(image, signatures[id(c)])[0])
-            removed.append(candidate)
-            _note(candidate, "全局检查发现高度重复，保留了另一时刻的代表图", [representative],
-                  time_gap_s=abs(candidate.time - representative.time), **details)
-        else:
-            kept.append(candidate)
-            if matches:
-                _note(candidate, "画面高度相似，但保留任务首尾位置", matches, **details)
-            elif comparisons:
-                representative, check = min(comparisons, key=lambda pair: max(
-                    pair[1]["rms"] / max(1e-9, config.global_dedup_rms_threshold),
-                    pair[1]["changed_fraction"] / max(1e-9, config.global_dedup_changed_fraction),
-                    pair[1]["max_tile_difference"] / max(1e-9, config.global_dedup_tile_threshold),
-                    pair[1]["max_patch_difference"] / max(1e-9, config.global_dedup_patch_threshold)))
-                _note(candidate, "与最接近画面比较后仍保留：" + "、".join(check["not_merged_because"]),
-                      [representative], closest_time=representative.time,
-                      not_merged_because=check["not_merged_because"], **details)
-            else:
-                _note(candidate, "保留第一张代表画面，后续图片会与它比较", **details)
-    # 只与最终确实留下的代表比较，不把 A≈B、B≈C 串联成 A≈C；去重后不补图凑数。
-    return sorted(kept, key=lambda c: c.time), sorted(removed, key=lambda c: c.time)
-
-
 @_with_feature_cache
 def _hybrid_keyframes(
     video: Path,
     work_dir: Path,
     config: KeyframeConfig,
     duration: float,
-) -> tuple[list[_Candidate], list[_Candidate], float | None, float | None, dict]:
+) -> tuple[list[_Candidate], float | None, float | None, dict]:
     effective_task_end, raw = _extract_candidates(
         video,
         work_dir,
@@ -1844,14 +1766,12 @@ def _hybrid_keyframes(
     _stage("local", "检查局部内容与代表图", local_pool, analysis.representatives)
     limited = _limit_candidates(analysis.representatives, config.max_frames, config=config, analysis=analysis)
     _stage("budget", "按新增内容自适应选图", analysis.representatives, limited)
-    selected, removed = _final_deduplicate(limited, config)
-    _stage("final", "全局去除高度重复 · 最终结果", limited, selected)
-    analysis.summary['selected_after_dedup'] = len(selected)
+    selected = limited
     analysis.summary['merged_content_review'] = review_summary
     recorder = _PROCESS.get()
     if recorder is not None:
         recorder.selection = analysis.summary
-    return selected, removed, effective_task_end, task_end_confidence, analysis.summary
+    return selected, effective_task_end, task_end_confidence, analysis.summary
 
 
 def extract_scene_keyframes(
@@ -1904,7 +1824,7 @@ def extract_scene_keyframes(
     metadata_path.unlink(missing_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="ae_kf_candidates_") as temp_dir:
-        selected, removed, effective_task_end, confidence, selection = _hybrid_keyframes(
+        selected, effective_task_end, confidence, selection = _hybrid_keyframes(
             video,
             Path(temp_dir),
             config,
@@ -1942,15 +1862,7 @@ def extract_scene_keyframes(
             "selected_count": len(records),
             "selection": selection,
             "selected": records,
-            "final_dedup_removed_count": len(removed),
-            "final_dedup_removed": [
-                {
-                    "time": round(candidate.time, 3),
-                    "source": candidate.source,
-                    "keep_reason": candidate.keep_reason,
-                }
-                for candidate in removed
-            ],
+
         }
         metadata_path.write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",

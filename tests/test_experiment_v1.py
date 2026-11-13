@@ -90,7 +90,7 @@ def test_real_video_retains_fast_evidence(tmp_path, name, filters, expected_colo
         assert not any(np.mean(image < 230) > 0.5 for image in old)
     metadata = json.loads((tmp_path / "experiment/keyframes.json").read_text(encoding="utf-8"))
     assert metadata["config"]["sample_fps"] == 4.0
-    assert metadata["algorithm_version"] == "hybrid-state-exp-v4"
+    assert metadata["algorithm_version"] == "hybrid-state-exp-v4.1"
     assert metadata["selected"][0]["time"] == 7.0
     assert "task-end-explicit" in [row["keep_reason"] for row in metadata["selected"]]
     assert all(row["time"] <= 38 for row in metadata["selected"])
@@ -100,5 +100,5 @@ def test_static_video_does_not_multiply_final_duplicates(tmp_path):
     path = picture(tmp_path / "static.jpg", "white")
     candidates = [media._Candidate(t, path, "4fps") for t in range(20)]
     selected = media._deduplicate_states(candidates, media.KeyframeConfig())
-    final, _ = media._final_deduplicate(selected, media.KeyframeConfig())
-    assert len(final) == 1
+    output = media._limit_candidates(selected, 15)
+    assert len(output) == 1

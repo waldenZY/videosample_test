@@ -165,16 +165,6 @@ def test_limit_reports_uncovered_content_and_is_deterministic(tmp_path):
     assert analysis.summary['uncovered_content']
 
 
-def test_final_dedup_cannot_erase_distinct_local_evidence(tmp_path):
-    start = shot(tmp_path, 'start', 0)
-    one = shot(tmp_path, 'one', 1, panel())
-    two = shot(tmp_path, 'two', 2, panel())
-    one.evidence_ids = ('setting-A',)
-    two.evidence_ids = ('setting-B',)
-    kept, removed = media._final_deduplicate([start, one, two], media.KeyframeConfig())
-    assert kept == [start, one, two] and not removed
-
-
 def test_review_can_restore_a_different_setting_and_skip_exact_repeats(tmp_path):
     one = shot(tmp_path, 'one', 1, panel('SETTING A: 07:00'))
     repeated = shot(tmp_path, 'repeated', 2, panel('SETTING A: 07:00'))
