@@ -83,6 +83,22 @@ def test_adaptive_selection_is_output_without_another_filter(tmp_path, video):
     assert 'final_dedup_removed' not in metadata
 
 
+def test_merged_candidates_are_not_restored_by_later_stages(tmp_path, video, monkeypatch):
+    # 故意让内容合并只留下首尾：后面不能重新引入中间的不同画面。
+    monkeypatch.setattr(media, '_merge_repeated_content', lambda candidates, config: [candidates[0], candidates[-1]])
+    with media.record_process(tmp_path / 'process') as recorder:
+        media.extract_scene_keyframes(video, tmp_path / 'final', task_end_time=13)
+    stages = {stage['id']: stage for stage in recorder.stages}
+    assert 'review' not in stages
+    assert 'merged_content_review' not in recorder.selection
+    expected = stages['content']['output_ids']
+    assert len(expected) == 2
+    assert stages['local']['input_ids'] == expected
+    assert set(stages['local']['output_ids']) <= set(expected)
+    assert stages['budget']['input_ids'] == stages['local']['output_ids']
+    assert set(stages['budget']['output_ids']) <= set(expected)
+
+
 def test_base_defaults_and_output_match_original(tmp_path, video, baseline):
     assert asdict(base_media.KeyframeConfig()) == asdict(baseline.KeyframeConfig())
     original = baseline.extract_scene_keyframes(video, tmp_path / "old", task_end_time=13)

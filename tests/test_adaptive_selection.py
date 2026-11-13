@@ -163,12 +163,3 @@ def test_limit_reports_uncovered_content_and_is_deterministic(tmp_path):
     assert analysis.summary['stop_reason'] == 'limit_reached'
     assert analysis.summary['hit_limit'] and analysis.summary['uncovered_count'] > 0
     assert analysis.summary['uncovered_content']
-
-
-def test_review_can_restore_a_different_setting_and_skip_exact_repeats(tmp_path):
-    one = shot(tmp_path, 'one', 1, panel('SETTING A: 07:00'))
-    repeated = shot(tmp_path, 'repeated', 2, panel('SETTING A: 07:00'))
-    other = shot(tmp_path, 'other', 3, panel('SETTING B: 21:30'))
-    restored, summary = media._review_merged_content([one], [repeated, other], media.KeyframeConfig())
-    assert restored == [one, other]
-    assert summary == {'reviewed_count': 2, 'rescued_count': 1}

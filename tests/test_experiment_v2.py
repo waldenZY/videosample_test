@@ -104,6 +104,6 @@ def test_long_animated_video_stays_within_limit_and_trace_explains_selection(tmp
     assert len(budget["output_ids"]) <= limit
     assert any(event["status"] == "dropped" and event["related"] for event in budget["events"])
     metadata = json.loads((tmp_path / "final/keyframes.json").read_text(encoding="utf-8"))
-    assert metadata["algorithm_version"] == "hybrid-state-exp-v4.2"
+    assert metadata["algorithm_version"] == "hybrid-state-exp-v4.3"
     assert metadata["config"]["max_frames"] == limit
     assert base_media.KeyframeConfig().max_frames == 20

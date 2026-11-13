@@ -36,14 +36,15 @@ def test_different_local_text_keeps_independent_content(tmp_path):
     assert media._limit_candidates(candidates, 15) == candidates
 
 
-def test_review_similarity_does_not_chain_through_discarded_images(tmp_path):
+def test_strict_local_comparison_does_not_treat_similarity_as_transitive(tmp_path):
+    import numpy as np
     config = media.KeyframeConfig(global_dedup_rms_threshold=1.5 / 255)
-    start = frame(tmp_path, 'start', 0, 'white')
-    a = frame(tmp_path, 'a', 10, (40, 40, 40), 3)
-    b = frame(tmp_path, 'b', 50, (41, 41, 41), 2)
-    c = frame(tmp_path, 'c', 100, (42, 42, 42), 1)
-    reviewed, _ = media._review_merged_content([start, a], [b, c], config)
-    assert reviewed == [start, a, c]
+    a = np.full((160, 96, 3), 40, dtype=np.uint8)
+    b = np.full_like(a, 41)
+    c = np.full_like(a, 42)
+    assert media._strict_local_equal(a, b, config)
+    assert media._strict_local_equal(b, c, config)
+    assert not media._strict_local_equal(a, c, config)
 
 
 def test_identical_endpoints_still_count_as_required_positions(tmp_path):

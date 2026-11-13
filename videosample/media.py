@@ -1,6 +1,6 @@
 """任务类（录屏）的混合关键帧抽取与帧编码。
 
-流程：固定频率与变化取图 → 原有时间/内容筛选 → 疑似误合并复核 →
+流程：固定频率与变化取图 → 原有时间/内容筛选 →
 局部内容与代表图检查 → 按新增内容自适应输出。
 
 FFmpeg 取图，Pillow/NumPy 比较；OpenCV 仅用于最后选图的局部检查。
@@ -31,7 +31,7 @@ from pathlib import Path
 import numpy as np
 
 
-KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4.2"
+KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4.3"
 DEFAULT_TASK_START_TIME = 7.0
 
 # 仅供实验台记录过程；不参与任何选帧决策。定稿迁回时可整体移除。
@@ -1192,7 +1192,7 @@ def _strict_region_equal(left, right, config):
             and float(maximum.reshape(40, 4, 24, 4).mean(axis=(1, 3)).max()) < config.global_dedup_patch_threshold)
 
 
-def _review_same_content(left, right, config):
+def _strict_local_equal(left, right, config):
     if not _strict_region_equal(left, right, config):
         return False
     cv = _local_cv()
@@ -1206,39 +1206,6 @@ def _review_same_content(left, right, config):
         if not _strict_region_equal(left[y0:y1, x0:x1], right[y0:y1, x0:x1], config):
             return False
     return True
-
-
-def _review_merged_content(main, dropped, config):
-    """保留前段决定，旁路复核被合并的内容；每个补回项仍需竞争同一上限。"""
-    pool = list(main)
-    signatures = [_content_signature(candidate.path) for candidate in pool]
-    known = {hashlib.sha256(signature.tobytes()).digest(): candidate for candidate, signature in zip(pool, signatures)}
-    descriptors = [_descriptor(signature).ravel() for signature in signatures]
-    rescued = []
-    for candidate in sorted(dropped, key=lambda c: c.time):
-        signature = _content_signature(candidate.path)
-        digest = hashlib.sha256(signature.tobytes()).digest()
-        representative = known.get(digest)
-        if representative is None and pool:
-            descriptor = _descriptor(signature).ravel()
-            differences = np.mean((np.asarray(descriptors) - descriptor) ** 2, axis=1)
-            for index in np.argsort(differences, kind='stable')[:4]:
-                if _review_same_content(signature, signatures[int(index)], config):
-                    representative = pool[int(index)]
-                    break
-        if representative is not None:
-            known[digest] = representative
-            _note(candidate, '前段合并复核：仍由已有相近内容代表', [representative])
-        else:
-            rescued.append(candidate)
-            pool.append(candidate)
-            signatures.append(signature)
-            descriptors.append(_descriptor(signature).ravel())
-            known[digest] = candidate
-            _note(candidate, '前段合并复核发现不同局部内容，补回候选')
-    for candidate in main:
-        _note(candidate, '保留主链路候选，局部复核只补回遗漏内容')
-    return sorted(pool, key=lambda c: c.time), {'reviewed_count': len(dropped), 'rescued_count': len(rescued)}
 
 
 def _local_boxes(rgb):
@@ -1348,7 +1315,7 @@ def _locate_local_content(track, crop, config, crop_gray=None):
             continue
         # 多个独立边缘才追加小字检查；单个加载圆点的重绘沿用原移动规则。
         edge_count, _ = cv.connectedComponents(cv.Canny(cv.cvtColor(left, cv.COLOR_RGB2GRAY), 60, 160))
-        if edge_count >= 5 and not _review_same_content(left, right, config):
+        if edge_count >= 5 and not _strict_local_equal(left, right, config):
             continue
         # 两幅有内容的图不能仅靠一段白底建立关系。
         if left.std() < 2 and (reference.std() >= 3 or crop.std() >= 3):
@@ -1938,7 +1905,6 @@ def _hybrid_keyframes(
     _stage("range", "确定任务范围", all_timestamp_unique + terminal_candidates,
            timestamp_unique + terminal_candidates)
     state_unique = _deduplicate_states(timestamp_unique, config)
-    state_kept_ids = {id(candidate) for candidate in state_unique}
     for candidate in terminal_candidates:
         _note(candidate, "视频末帧单独保留，暂不参与页面合并")
     _stage("states", "合并重复页面", timestamp_unique + terminal_candidates,
@@ -1976,19 +1942,11 @@ def _hybrid_keyframes(
     _stage("endpoints", "保留任务首尾", before_forced, combined_ordered)
     content_unique = _merge_repeated_content(combined_ordered, config)
     _stage("content", "合并重复内容", combined_ordered, content_unique)
-    content_kept_ids = {id(candidate) for candidate in content_unique}
-    review = [candidate for candidate in timestamp_unique if id(candidate) not in state_kept_ids]
-    review += [candidate for candidate in combined_ordered if id(candidate) not in content_kept_ids]
-    review = [candidate for candidate in review if candidate is task_end_candidate
-              or not terminal_candidates or abs(candidate.time - terminal_candidates[-1].time) > .5]
-    local_pool, review_summary = _review_merged_content(content_unique, review, config)
-    _stage('review', '复核前段相近内容', sorted(content_unique + review, key=lambda c: c.time), local_pool)
-    analysis = _analyze_local_content(local_pool, config)
-    _stage("local", "检查局部内容与代表图", local_pool, analysis.representatives)
+    analysis = _analyze_local_content(content_unique, config)
+    _stage("local", "检查局部内容与代表图", content_unique, analysis.representatives)
     limited = _limit_candidates(analysis.representatives, config.max_frames, config=config, analysis=analysis)
     _stage("budget", "按新增内容自适应选图", analysis.representatives, limited)
     selected = limited
-    analysis.summary['merged_content_review'] = review_summary
     recorder = _PROCESS.get()
     if recorder is not None:
         recorder.selection = analysis.summary

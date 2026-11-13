@@ -90,7 +90,7 @@ def test_real_video_retains_fast_evidence(tmp_path, name, filters, expected_colo
         assert not any(np.mean(image < 230) > 0.5 for image in old)
     metadata = json.loads((tmp_path / "experiment/keyframes.json").read_text(encoding="utf-8"))
     assert metadata["config"]["sample_fps"] == 4.0
-    assert metadata["algorithm_version"] == "hybrid-state-exp-v4.2"
+    assert metadata["algorithm_version"] == "hybrid-state-exp-v4.3"
     assert metadata["selected"][0]["time"] == 7.0
     assert "task-end-explicit" in [row["keep_reason"] for row in metadata["selected"]]
     assert all(row["time"] <= 38 for row in metadata["selected"])
