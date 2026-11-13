@@ -3,7 +3,7 @@
 流程：固定频率采样 + scene 候选 → UI 状态聚类 → 短暂弹窗保护 →
 任务结束点判断 → 强制首帧/任务结束帧（无显式结束点时保留视频末帧）→ 最终严格去重。
 
-纯 ffmpeg + Pillow + NumPy，不依赖 OpenCV。
+FFmpeg 取图，Pillow/NumPy 比较；OpenCV 仅用于最后选图的局部检查。
 """
 from __future__ import annotations
 
@@ -19,10 +19,11 @@ import shutil
 import subprocess
 import tempfile
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from functools import lru_cache, wraps
 from numbers import Integral, Real
 from pathlib import Path
@@ -30,13 +31,14 @@ from pathlib import Path
 import numpy as np
 
 
-KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v3"
+KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4"
 DEFAULT_TASK_START_TIME = 7.0
 
 # 仅供实验台记录过程；不参与任何选帧决策。定稿迁回时可整体移除。
 _PROCESS = ContextVar("keyframe_process", default=None)
 _FEATURES = ContextVar("keyframe_features", default=None)
 _FEATURE_KEYS = ContextVar("keyframe_feature_keys", default=None)
+_SMALL_FEATURES = ContextVar("keyframe_small_features", default=None)
 
 
 def _cached_feature(function):
@@ -45,6 +47,10 @@ def _cached_feature(function):
         cache = _FEATURES.get()
         if cache is None:
             return function(path)
+        small = function.__name__ in {'_layout_signature', '_assistant_shell_signature'}
+        if small and _SMALL_FEATURES.get() is not None:
+            cache = _SMALL_FEATURES.get()
+        capacity = 4096 if small else 2048 if function.__name__ == '_content_signature' else 512
         identities = _FEATURE_KEYS.get()
         identity = str(path)
         if identities is not None:
@@ -54,7 +60,8 @@ def _cached_feature(function):
                     identities[identity] = hashlib.sha256(Path(path).read_bytes()).digest()
                 except OSError:
                     identities[identity] = identity
-                if len(identities) > 512:
+                identity_capacity = 2048 if small or function.__name__ == '_content_signature' else 512
+                if len(identities) > identity_capacity:
                     identities.popitem(last=False)
             else:
                 identities.move_to_end(identity)
@@ -62,7 +69,7 @@ def _cached_feature(function):
         key = (function.__name__, identity)
         if key not in cache:
             cache[key] = function(path)
-            if len(cache) > 512:
+            if len(cache) > capacity:
                 cache.popitem(last=False)
         else:
             cache.move_to_end(key)
@@ -75,12 +82,52 @@ def _with_feature_cache(function):
     def cached(*args, **kwargs):
         token = _FEATURES.set(OrderedDict())
         identities_token = _FEATURE_KEYS.set(OrderedDict())
+        small_token = _SMALL_FEATURES.set(OrderedDict())
         try:
             return function(*args, **kwargs)
         finally:
             _FEATURES.reset(token)
             _FEATURE_KEYS.reset(identities_token)
+            _SMALL_FEATURES.reset(small_token)
     return cached
+
+
+def _prewarm_features(candidates, function):
+    """并行读取/计算独立特征，结果按原输入顺序写入单次抽帧缓存。"""
+    features, identities = _FEATURES.get(), _FEATURE_KEYS.get()
+    if features is None or identities is None or len(candidates) < 8:
+        return
+    small = function.__name__ in {'_layout_signature', '_assistant_shell_signature'}
+    cache = _SMALL_FEATURES.get() if small else features
+    capacity = 4096 if small else 2048
+    paths, seen = [], set()
+    for candidate in candidates:
+        path = candidate.path
+        digest = identities.get(str(path))
+        key = digest if isinstance(digest, bytes) else str(path)
+        if key in seen or (function.__name__, digest) in cache:
+            continue
+        seen.add(key)
+        paths.append(path)
+    if not paths:
+        return
+    def load(path):
+        payload = path.read_bytes()
+        digest = hashlib.sha256(payload).digest()
+        value = function.__wrapped__(io.BytesIO(payload))
+        return path, digest, value
+    worker_count = min(8, max(1, (os.cpu_count() or 2) // 2))
+    with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix='frame-feature') as workers:
+        for path, digest, value in workers.map(load, paths):
+            identities[str(path)] = digest
+            identities.move_to_end(str(path))
+            if len(identities) > 2048:
+                identities.popitem(last=False)
+            key = (function.__name__, digest)
+            if key not in cache:
+                cache[key] = value
+                if len(cache) > capacity:
+                    cache.popitem(last=False)
 
 
 class _ProcessRecord:
@@ -92,17 +139,19 @@ class _ProcessRecord:
         self.stages = []
         self.notes = {}
         self.initial_frame_count = None
+        self.selection = None
         self.timings = {}
         self.record_io_s = 0.0
         self.last_stage_end = time.perf_counter()
 
-    def identify(self, candidate):
+    def identify(self, candidate, *, copy_image=True):
         identity = self.identities.get(id(candidate))
         if identity is None:
             identity = f"f{len(self.frames) + 1:05d}"
             self.identities[id(candidate)] = identity
             target = self.directory / "candidates" / f"{identity}.jpg"
-            shutil.copy2(candidate.path, target)
+            if copy_image:
+                shutil.copy2(candidate.path, target)
             self.frames.append({"id": identity, "time": round(candidate.time, 3),
                                 "source": candidate.source,
                                 "image": f"candidates/{identity}.jpg", "history": []})
@@ -112,6 +161,13 @@ class _ProcessRecord:
         started = time.perf_counter()
         elapsed = started - self.last_stage_end
         self.timings[key] = self.timings.get(key, 0.0) + elapsed
+        if not self.frames and not before and after:
+            copies = []
+            for candidate in after:
+                identity = self.identify(candidate, copy_image=False)
+                copies.append((candidate.path, self.directory / 'candidates' / f'{identity}.jpg'))
+            with ThreadPoolExecutor(max_workers=4, thread_name_prefix='frame-copy') as workers:
+                list(workers.map(lambda pair: shutil.copy2(*pair), copies))
         before_ids = [self.identify(c) for c in before]
         after_ids = [self.identify(c) for c in after]
         if self.initial_frame_count is None:
@@ -146,12 +202,13 @@ class _ProcessRecord:
         started = time.perf_counter()
         payload = {"algorithm_version": KEYFRAME_ALGORITHM_VERSION,
                    "initial_frame_count": self.initial_frame_count,
+                   "selection": self.selection,
                    "frames": self.frames, "stages": self.stages,
                    "timings_s": {**{key: round(value, 4) for key, value in self.timings.items()},
                                  "process_io": round(self.record_io_s, 4)}}
         target = self.directory / "trace.json"
         temporary = target.with_suffix(".tmp")
-        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, separators=(',', ':')), encoding="utf-8")
         temporary.replace(target)
         self.record_io_s += time.perf_counter() - started
 
@@ -251,7 +308,7 @@ class KeyframeConfig:
 
     task_start_time: float = DEFAULT_TASK_START_TIME
     task_end_time: float | None = None
-    max_frames: int = 25
+    max_frames: int = 15
     sample_fps: float = 4.0
     scene_threshold: float = 0.02
     scene_min_gap_s: float = 0.15
@@ -277,6 +334,9 @@ class KeyframeConfig:
     global_dedup_changed_fraction: float = 0.003
     global_dedup_tile_threshold: float = 0.01
     global_dedup_patch_threshold: float = 0.02
+    local_analysis_max_edge: int = 320
+    local_template_threshold: float = 0.90
+    local_content_bin_height: int = 24
     # 受保护采样：在开头和结尾两个时间窗口内，每 interval 秒额外标记一帧，
     # 仅当画面高度一致时才去重（用于捕获弹窗/横幅/开场状态等开头结尾的小变化）。
     protected_sample_interval: float = 2.0  # 0 = 禁用；>0 则每 N 秒一帧
@@ -306,8 +366,12 @@ class KeyframeConfig:
             and self.task_end_time <= self.task_start_time
         ):
             raise ValueError("task_end_time 必须大于 task_start_time")
-        if isinstance(self.max_frames, bool) or not isinstance(self.max_frames, Integral) or self.max_frames < 2:
-            raise ValueError("max_frames 必须为不小于 2 的整数")
+        if isinstance(self.max_frames, bool) or not isinstance(self.max_frames, Integral) or not 2 <= self.max_frames <= 15:
+            raise ValueError("实验版 max_frames 必须为 2 到 15 的整数")
+        if self.local_analysis_max_edge < 64 or self.local_content_bin_height < 4:
+            raise ValueError("局部分析尺寸或内容分段过小")
+        if not 0 < self.local_template_threshold <= 1:
+            raise ValueError("局部匹配阈值必须在 0 到 1 之间")
         if self.sample_fps <= 0:
             raise ValueError("sample_fps 必须大于 0")
         if self.max_edge <= 0:
@@ -332,6 +396,7 @@ class _Candidate:
     keep_reason: str = ""
     support_s: float = 0.0
     page_id: int = -1
+    evidence_ids: tuple[str, ...] = ()
 
 
 def probe_duration(video: Path | str) -> float:
@@ -436,7 +501,7 @@ def _even_sample(times: list[float], count: int) -> list[float]:
 
 def select_keyframe_times(
     video: Path | str,
-    max_frames: int = 25,
+    max_frames: int = 15,
     min_frames: int = 4,
     threshold: float = 0.02,
     min_gap_s: float = 0.15,
@@ -882,6 +947,7 @@ def _build_layout_runs(
 ) -> tuple[list[np.ndarray], list[list[int]]]:
     if not candidates:
         return [], []
+    _prewarm_features(candidates, _layout_signature)
     layouts = [_layout_signature(candidate.path) for candidate in candidates]
     runs: list[list[int]] = [[0]]
     for index in range(1, len(candidates)):
@@ -982,11 +1048,20 @@ def _content_groups(candidates, config):
         return _content_signature(Path(path))
 
     groups = []
+    descriptors = np.empty((len(candidates), 20, 12, 3), dtype=np.float32)
+    coarse_descriptors = np.empty((len(candidates), 48), dtype=np.float32)
     for candidate in candidates:
         image = pixels(str(candidate.path))
         descriptor = _descriptor(image)
         found = None
-        for group in reversed(groups):
+        # 批量做廉价预筛；临界值仍按原标量公式复核，保持组顺序与决定不变。
+        coarse = descriptor.reshape(4, 5, 4, 3, 3).mean(axis=(1, 3)).ravel()
+        coarse_squared = np.mean((coarse_descriptors[:len(groups)] - coarse) ** 2, axis=1)
+        possible = np.flatnonzero(coarse_squared <= (config.content_rms_threshold + 5e-7) ** 2)
+        squared = np.mean((descriptors[possible] - descriptor) ** 2, axis=(1, 2, 3))
+        possible = possible[squared <= (config.content_rms_threshold + 1e-7) ** 2]
+        for index in reversed(possible):
+            group = groups[int(index)]
             if float(np.sqrt(np.mean((descriptor - group["descriptor"]) ** 2))) > config.content_rms_threshold:
                 continue
             other = pixels(str(group["reference"].path))
@@ -996,6 +1071,8 @@ def _content_groups(candidates, config):
                 found = group
                 break
         if found is None:
+            descriptors[len(groups)] = descriptor
+            coarse_descriptors[len(groups)] = coarse
             groups.append({"members": [candidate], "representative": candidate, "reference": candidate,
                            "descriptor": descriptor, "support": candidate.support_s})
         else:
@@ -1012,16 +1089,25 @@ def _deduplicate_states(candidates, config):
         return []
     layouts, runs = _build_layout_runs(candidates, config.state_layout_threshold)
     pages = []
+    page_layouts = np.empty((len(runs), *layouts[0].shape), dtype=np.float32)
+    coarse_layouts = np.empty((len(runs), 16), dtype=np.float32)
     selected = []
     interval = 1.0 / config.sample_fps
     for index, candidate in enumerate(candidates):
         candidate.support_s = min(interval, max(0.0, candidates[index + 1].time - candidate.time)) if index + 1 < len(candidates) else interval
     for run in runs:
         layout = layouts[run[0]]
-        page = next((i for i, known in enumerate(pages)
-                     if _layout_distance(layout, known) < config.state_layout_threshold), None)
+        coarse = layout.reshape(4, 6, 4, 4).mean(axis=(1, 3)).ravel()
+        coarse_distances = np.mean((coarse_layouts[:len(pages)] - coarse) ** 2, axis=1)
+        possible = np.flatnonzero(coarse_distances <= (255 * config.state_layout_threshold + 1e-4) ** 2)
+        distances = np.mean((page_layouts[possible] - layout) ** 2, axis=(1, 2))
+        possible = possible[distances <= (255 * config.state_layout_threshold + 1e-5) ** 2]
+        page = next((int(i) for i in possible
+                     if _layout_distance(layout, pages[int(i)]) < config.state_layout_threshold), None)
         if page is None:
             page = len(pages)
+            page_layouts[page] = layout
+            coarse_layouts[page] = coarse
             pages.append(layout)
         for index in run:
             candidates[index].page_id = page
@@ -1065,66 +1151,495 @@ def _merge_repeated_content(candidates, config):
     return sorted(selected, key=lambda c: c.time)
 
 
-def _limit_candidates(candidates, limit, *, config=None):
-    """内容先归组；优先覆盖不同页面，再分配剩余内容名额。"""
+@lru_cache(maxsize=1)
+def _local_cv():
+    try:
+        import cv2
+    except ImportError as exc:
+        raise RuntimeError("实验版局部检查需要 OpenCV，请在当前环境安装 requirements.txt") from exc
+    # 平台本身并行两题；避免每次小图比较再启动一组原生工作线程。
+    cv2.setNumThreads(1)
+    return cv2
+
+
+def _strict_region_equal(left, right, config):
+    """同样的四项严格条件，应用于对齐后的局部内容，而非整页平均。"""
+    cv = _local_cv()
+    coarse_left = cv.resize(left, (8, 8), interpolation=cv.INTER_AREA).astype(np.float32)
+    coarse_right = cv.resize(right, (8, 8), interpolation=cv.INTER_AREA).astype(np.float32)
+    # 粗平均差异是后续 RMS 的下界；额外保留两级像素量化余量，
+    # 明显不同的重叠区不用反复生成较大的比较数组。
+    coarse_rms = float(np.sqrt(np.mean((coarse_left - coarse_right) ** 2)) / 255)
+    if coarse_rms > config.global_dedup_rms_threshold + 2 / 255:
+        return False
+    left = cv.resize(left, (96, 160), interpolation=cv.INTER_AREA).astype(np.float32)
+    right = cv.resize(right, (96, 160), interpolation=cv.INTER_AREA).astype(np.float32)
+    delta = np.abs(left - right)
+    if float(np.sqrt(np.mean(delta * delta)) / 255) >= config.global_dedup_rms_threshold:
+        return False
+    if float(np.mean(np.any(delta >= 12, axis=-1))) >= config.global_dedup_changed_fraction:
+        return False
+    maximum = delta.max(axis=-1) / 255
+    return (float(maximum.reshape(8, 20, 6, 16).mean(axis=(1, 3)).max()) < config.global_dedup_tile_threshold
+            and float(maximum.reshape(40, 4, 24, 4).mean(axis=(1, 3)).max()) < config.global_dedup_patch_threshold)
+
+
+def _review_same_content(left, right, config):
+    if not _strict_region_equal(left, right, config):
+        return False
+    cv = _local_cv()
+    mask = (np.max(np.abs(left.astype(np.int16) - right.astype(np.int16)), axis=2) >= 12).astype(np.uint8)
+    count, _, stats, _ = cv.connectedComponentsWithStats(mask, connectivity=8)
+    for x, y, w, h, area in stats[1:count]:
+        if area < 4:
+            continue
+        x0, y0 = max(0, x - 2), max(0, y - 2)
+        x1, y1 = min(left.shape[1], x + w + 2), min(left.shape[0], y + h + 2)
+        if not _strict_region_equal(left[y0:y1, x0:x1], right[y0:y1, x0:x1], config):
+            return False
+    return True
+
+
+def _review_merged_content(main, dropped, config):
+    """保留前段决定，旁路复核被合并的内容；每个补回项仍需竞争同一上限。"""
+    pool = list(main)
+    signatures = [_content_signature(candidate.path) for candidate in pool]
+    known = {hashlib.sha256(signature.tobytes()).digest(): candidate for candidate, signature in zip(pool, signatures)}
+    descriptors = [_descriptor(signature).ravel() for signature in signatures]
+    rescued = []
+    for candidate in sorted(dropped, key=lambda c: c.time):
+        signature = _content_signature(candidate.path)
+        digest = hashlib.sha256(signature.tobytes()).digest()
+        representative = known.get(digest)
+        if representative is None and pool:
+            descriptor = _descriptor(signature).ravel()
+            differences = np.mean((np.asarray(descriptors) - descriptor) ** 2, axis=1)
+            for index in np.argsort(differences, kind='stable')[:4]:
+                if _review_same_content(signature, signatures[int(index)], config):
+                    representative = pool[int(index)]
+                    break
+        if representative is not None:
+            known[digest] = representative
+            _note(candidate, '前段合并复核：仍由已有相近内容代表', [representative])
+        else:
+            rescued.append(candidate)
+            pool.append(candidate)
+            signatures.append(signature)
+            descriptors.append(_descriptor(signature).ravel())
+            known[digest] = candidate
+            _note(candidate, '前段合并复核发现不同局部内容，补回候选')
+    for candidate in main:
+        _note(candidate, '保留主链路候选，局部复核只补回遗漏内容')
+    return sorted(pool, key=lambda c: c.time), {'reviewed_count': len(dropped), 'rescued_count': len(rescued)}
+
+
+def _local_boxes(rgb):
+    """颜色块和矩形轮廓只是关注区域线索，不是业务卡片识别。"""
+    cv = _local_cv()
+    height, width = rgb.shape[:2]
+    corners = np.concatenate([rgb[:4, :4].reshape(-1, 3), rgb[:4, -4:].reshape(-1, 3),
+                              rgb[-4:, :4].reshape(-1, 3), rgb[-4:, -4:].reshape(-1, 3)])
+    background = np.median(corners, axis=0).astype(np.uint8)
+    foreground = (np.max(np.abs(rgb.astype(np.int16) - background), axis=2) >= 18).astype(np.uint8)
+    foreground = cv.morphologyEx(foreground, cv.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    count, _, stats, _ = cv.connectedComponentsWithStats(foreground, connectivity=8)
+    boxes = []
+    for x, y, w, h, area in stats[1:count]:
+        if area / max(1, w * h) >= .55:
+            boxes.append((int(x), int(y), int(w), int(h)))
+    gray = cv.cvtColor(rgb, cv.COLOR_RGB2GRAY)
+    contours, _ = cv.findContours(cv.Canny(gray, 60, 160), cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE)
+    for contour in contours:
+        x, y, w, h = cv.boundingRect(contour)
+        if cv.contourArea(contour) >= .80 * w * h:
+            boxes.append((x, y, w, h))
+    accepted = []
+    for box in sorted(set(boxes), key=lambda b: (-b[2] * b[3], b)):
+        x, y, w, h = box
+        area = w * h / (width * height)
+        if w < .30 * width or h < .08 * height or not .035 <= area <= .93:
+            continue
+        if any(max(0, min(x + w, a + c) - max(x, a)) * max(0, min(y + h, b + d) - max(y, b))
+               >= .8 * min(w * h, c * d) for a, b, c, d in accepted):
+            continue
+        accepted.append(box)
+        if len(accepted) == 4:
+            break
+    return accepted, background
+
+
+@dataclass
+class _LocalTrack:
+    index: int
+    pixels: np.ndarray
+    origin: int
+    width_ratio: float
+    kind: str
+    last_index: int
+    observations: list = field(default_factory=list)
+    bins: list | None = None
+    color: np.ndarray | None = None
+    gray: np.ndarray | None = None
+    reliable: bool = True
+
+
+@dataclass
+class _LocalAnalysis:
+    candidates: list
+    representatives: list = field(default_factory=list)
+    replacements: dict = field(default_factory=dict)
+    coverage: dict = field(default_factory=dict)
+    units: dict = field(default_factory=dict)
+    quality: dict = field(default_factory=dict)
+    details: dict = field(default_factory=dict)
+    descriptors: dict = field(default_factory=dict)
+    summary: dict = field(default_factory=dict)
+
+
+def _locate_local_content(track, crop, config, crop_gray=None):
+    """用有纹理的小条匹配位移，再严格核对整个重叠区；不靠匹配分数合并文字。"""
+    cv = _local_cv()
+    reference = track.pixels
+    if reference.shape[1] != crop.shape[1]:
+        return None
+    rh, ch = len(reference), len(crop)
+    possible = {track.origin, track.origin + rh - ch}
+    scores = {position: 0.0 for position in possible}
+    if track.gray is None:
+        track.gray = cv.cvtColor(reference, cv.COLOR_RGB2GRAY)
+    rg = track.gray
+    cg = crop_gray if crop_gray is not None else cv.cvtColor(crop, cv.COLOR_RGB2GRAY)
+    for source, target, reverse in ((cg, rg, False), (rg, cg, True)):
+        sh, th = len(source), len(target)
+        strip_height = min(24, max(8, sh // 3))
+        if strip_height > th:
+            continue
+        energy = np.mean(np.abs(np.diff(source.astype(np.float32), axis=1)), axis=1)
+        textured = int(np.argmax(np.convolve(energy, np.ones(strip_height), mode='valid')))
+        for y in sorted({0, max(0, (sh - strip_height) // 2), sh - strip_height, textured}):
+            patch = source[y:y + strip_height, 2:-2]
+            if float(patch.std()) < 3:
+                continue
+            matches = cv.matchTemplate(target, patch, cv.TM_CCOEFF_NORMED)
+            _, score, _, (x, match_y) = cv.minMaxLoc(matches)
+            if score < config.local_template_threshold or abs(x - 2) > 1:
+                continue
+            position = track.origin + (y - match_y if reverse else match_y - y)
+            for adjustment in (-1, 0, 1):
+                possible.add(position + adjustment)
+                scores[position + adjustment] = score
+    best = None
+    for position in sorted(possible):
+        top, bottom = max(track.origin, position), min(track.origin + rh, position + ch)
+        overlap = bottom - top
+        if overlap < min(rh, ch) * .40 or overlap < 8:
+            continue
+        left = reference[top - track.origin:bottom - track.origin, 2:-2]
+        right = crop[top - position:bottom - position, 2:-2]
+        if not _strict_region_equal(left, right, config):
+            continue
+        # 两幅有内容的图不能仅靠一段白底建立关系。
+        if left.std() < 2 and (reference.std() >= 3 or crop.std() >= 3):
+            continue
+        value = (overlap, scores.get(position, 0), -abs(position - track.origin))
+        if best is None or value > best[0]:
+            best = (value, position, scores.get(position, 0))
+    return None if best is None else (best[1], best[2])
+
+
+def _extend_local_track(track, crop, position):
+    """只扩展观察到的新范围；既有参考像素不被后续近似图覆盖，避免漂移。"""
+    top = min(track.origin, position)
+    bottom = max(track.origin + len(track.pixels), position + len(crop))
+    if bottom - top > 4096:
+        return False
+    if top == track.origin and bottom == track.origin + len(track.pixels):
+        return True
+    combined = np.empty((bottom - top, track.pixels.shape[1], 3), dtype=np.uint8)
+    combined[position - top:position - top + len(crop)] = crop
+    combined[track.origin - top:track.origin - top + len(track.pixels)] = track.pixels
+    track.origin, track.pixels = top, combined
+    track.gray = None
+    track.color = np.median(combined, axis=(0, 1))
+    return True
+
+
+def _selection_anchors(candidates, limit):
     if not candidates:
         return []
-    config = config or KeyframeConfig()
-    if len(candidates) <= limit:
-        for candidate in candidates:
-            _note(candidate, "内容代表数量未超过上限，保留", frame_limit=limit)
-        return candidates
-    # 只有时间语义上的首尾为固定名额，短页面与定时保护采样不再无限豁免。
-    anchors = [candidates[0]]
     endings = sorted([c for c in candidates[1:] if c.keep_reason in {
-        "task-end-explicit", "task-end-auto", "final-frame"}],
-        key=lambda c: (c.keep_reason != "final-frame", c.time), reverse=True)
-    anchors.extend(endings[:max(0, limit - 1)])
-    selected = list(dict((id(c), c) for c in anchors).values())
-    pixels = {id(c): _content_signature(c.path) for c in candidates}
+        'task-end-explicit', 'task-end-auto', 'final-frame'}],
+        key=lambda c: (c.keep_reason != 'final-frame', c.time), reverse=True)
+    return [candidates[0], *endings[:max(0, limit - 1)]]
 
-    def distance(left, right):
-        rms, _ = _content_difference(pixels[id(left)], pixels[id(right)])
-        return rms + 0.5 * _tile_difference(pixels[id(left)], pixels[id(right)])
 
-    nearest, nearest_to = {}, {}
-    for candidate in candidates:
-        if candidate not in selected:
-            value, other = min(((distance(candidate, other), other) for other in selected), key=lambda pair: pair[0])
-            nearest[id(candidate)], nearest_to[id(candidate)] = value, other
-    decisions = {id(c): "保留任务首帧或结束位置" for c in selected}
-    while len(selected) < min(limit, len(candidates)):
-        remaining = [c for c in candidates if c not in selected]
-        covered = {c.page_id for c in selected}
-        uncovered = [c for c in remaining if c.page_id not in covered]
-        pool = uncovered or remaining
+def _local_track_bins(track, config):
+    if track.bins is not None:
+        return track.bins
+    cv = _local_cv()
+    pixels = track.pixels
+    edges = cv.Canny(cv.cvtColor(pixels, cv.COLOR_RGB2GRAY), 50, 150)
+    base = np.median(pixels.reshape(-1, 3), axis=0)
+    colored = np.max(np.abs(pixels.astype(np.float32) - base), axis=2) >= 16
+    signal = (np.count_nonzero(edges, axis=1) >= 2) | (colored.mean(axis=1) >= .02)
+    bins, size = [], config.local_content_bin_height
+    for number in range(math.floor(track.origin / size), math.ceil((track.origin + len(pixels)) / size)):
+        top, bottom = max(track.origin, number * size), min(track.origin + len(pixels), (number + 1) * size)
+        rows = np.flatnonzero(signal[top - track.origin:bottom - track.origin]) + top
+        if len(rows):
+            bins.append((number, rows))
+    return bins or [(0, np.array([track.origin + len(pixels) // 2]))]
 
-        def score(candidate):
-            same_page = sum(c.page_id == candidate.page_id for c in selected)
-            stability = 0.8 + 0.2 * min(1.0, candidate.support_s / max(0.001, config.stable_min_duration_s))
-            return nearest[id(candidate)] * stability / (1.0 + 0.35 * same_page)
 
-        best = max(pool, key=lambda c: (score(c), c.support_s, c.time))
-        decisions[id(best)] = "为尚未覆盖的页面保留内容代表" if uncovered else "优先保留新增内容较多的画面"
-        selected.append(best)
-        nearest.pop(id(best))
-        nearest_to.pop(id(best))
-        for candidate in remaining:
-            if candidate is not best:
-                value = distance(candidate, best)
-                if value < nearest[id(candidate)]:
-                    nearest[id(candidate)], nearest_to[id(candidate)] = value, best
-    selected_ids = {id(c) for c in selected}
-    for candidate in candidates:
-        if id(candidate) in selected_ids:
-            _note(candidate, decisions[id(candidate)], frame_limit=limit, page=candidate.page_id + 1,
-                  support_s=candidate.support_s)
+def _local_views(candidates, config, fingerprints):
+    """最多预读八张，顺序消费结果，避免同时持有整段视频的原尺寸图。"""
+    from PIL import Image
+    cv = _local_cv()
+    identities = dict(_FEATURE_KEYS.get() or {})
+    def load(candidate):
+        digest = identities.get(str(candidate.path))
+        payload = None
+        if not isinstance(digest, bytes):
+            payload = candidate.path.read_bytes()
+            digest = hashlib.sha256(payload).digest()
+        if digest in fingerprints:
+            return candidate, digest, None, None, None, None
+        with Image.open(io.BytesIO(payload) if payload is not None else candidate.path) as image:
+            source = np.asarray(image.convert('RGB'))
+        height, width = source.shape[:2]
+        scale = min(1.0, config.local_analysis_max_edge / max(height, width))
+        small = cv.resize(source, (max(8, round(width * scale)), max(8, round(height * scale))),
+                          interpolation=cv.INTER_AREA)
+        boxes, background = _local_boxes(small)
+        return candidate, digest, source, small, boxes, background
+    with ThreadPoolExecutor(max_workers=4, thread_name_prefix='frame-local-read') as workers:
+        iterator, pending = iter(candidates), deque()
+        for _ in range(8):
+            candidate = next(iterator, None)
+            if candidate is None:
+                break
+            pending.append(workers.submit(load, candidate))
+        while pending:
+            yield pending.popleft().result()
+            candidate = next(iterator, None)
+            if candidate is not None:
+                pending.append(workers.submit(load, candidate))
+
+
+def _analyze_local_content(candidates, config):
+    """仅分析名额分配前的候选；计算过程与实验台记录完全独立。"""
+    cv = _local_cv()
+    analysis = _LocalAnalysis(list(candidates))
+    tracks, backgrounds, fingerprints, background_keys = [], [], {}, {}
+    background_descriptors = np.empty((len(candidates), 48), dtype=np.float32)
+    for index, (candidate, digest, source, small, boxes, background) in enumerate(_local_views(candidates, config, fingerprints)):
+        identity = id(candidate)
+        candidate.evidence_ids = ()
+        analysis.coverage[identity] = set()
+        if digest in fingerprints:
+            previous = fingerprints[digest]
+            analysis.details[identity] = {**analysis.details[id(previous)], 'exact_repeat_of': previous.time}
+            analysis.quality[identity] = analysis.quality[id(previous)]
+            analysis.descriptors[identity] = analysis.descriptors[id(previous)]
+            for track in tracks:
+                old = next((o for o in track.observations if o['candidate'] is previous), None)
+                if old is not None:
+                    track.observations.append({**old, 'candidate': candidate})
+            background_id = analysis.details[identity]['background_id']
+            analysis.coverage[identity].add(background_id)
+            continue
+        fingerprints[digest] = candidate
+        height, width = source.shape[:2]
+        scale = min(1.0, config.local_analysis_max_edge / max(height, width))
+        fallback = not boxes
+        if fallback:
+            boxes = [(0, 0, small.shape[1], small.shape[0])]
+        masked = small.copy()
+        regions, exposures, clipped_edges, sharpness, motion = [], [], [], [], []
+        for x, y, w, h in boxes:
+            x0, y0 = round(x / scale), round(y / scale)
+            x1, y1 = min(width, round((x + w) / scale)), min(height, round((y + h) / scale))
+            source_crop = source[y0:y1, x0:x1]
+            # 局部卡片保留原图采样尺度。分别按可见高度缩放会改变字形，
+            # 使同一卡片的半张/全张无法通过严格重叠检查。
+            if fallback:
+                crop = source_crop[2:-2].copy() if source_crop.shape[1] <= 320 else small[2:-2].copy()
+            else:
+                crop = source_crop[2:-2].copy()
+            kind = 'scene' if fallback else 'local'
+            ratio = w / small.shape[1]
+            matched = None
+            crop_color = np.median(crop, axis=(0, 1))
+            crop_gray = cv.cvtColor(crop, cv.COLOR_RGB2GRAY)
+            active = [track for track in tracks if track.pixels is not None and track.kind == kind]
+            # 位移跟踪只检查时间上邻近的内容；跨时间的完全重复由文件标记复用。
+            # 整页逐一匹配几十个旧页面既不能解释操作，还会使动态视频耗时失控。
+            recent = sorted(active, key=lambda t: (-t.last_index, t.index))[:1 if fallback else 8]
+            for track in recent:
+                if not .85 <= ratio / track.width_ratio <= 1.18:
+                    continue
+                if fallback and np.abs(crop_color - track.color).max() > 40:
+                    continue
+                location = _locate_local_content(track, crop, config, crop_gray)
+                if location is not None and _extend_local_track(track, crop, location[0]):
+                    matched = track, location
+                    break
+            if matched is None:
+                track = _LocalTrack(len(tracks), crop.copy(), 0, ratio, kind, index)
+                track.color, track.gray = crop_color, crop_gray
+                if fallback and float(crop_gray.std()) < 2:
+                    track.reliable = not any(old.gray is not None and float(old.gray.std()) < 2
+                                             and np.abs(old.color - crop_color).max() <= 8 for old in active)
+                tracks.append(track)
+                position, confidence = 0, 0.0
+            else:
+                track, (position, confidence) = matched
+            track.last_index = index
+            track.observations.append({'candidate': candidate, 'top': position, 'bottom': position + len(crop)})
+            clipped = 0 if fallback else sum((x <= 1, y <= 1, x + w >= small.shape[1] - 1,
+                                              y + h >= small.shape[0] - 1))
+            gray = cv.cvtColor(crop, cv.COLOR_RGB2GRAY)
+            clarity = float(cv.Laplacian(gray, cv.CV_32F).var())
+            exposures.append(len(crop))
+            clipped_edges.append(clipped)
+            sharpness.append(clarity)
+            motion.append(abs(position))
+            regions.append({'track': track.index, 'kind': kind, 'box': [x0, y0, x1 - x0, y1 - y0],
+                            'possible_clipping': bool(clipped), 'match_confidence': round(float(confidence), 4),
+                            'visible_range': [position, position + len(crop)]})
+            masked[y:y + h, x:x + w] = background
+        signature = cv.resize(masked, (96, 160), interpolation=cv.INTER_AREA)
+        background_key = hashlib.sha256(signature.tobytes()).digest()
+        background_index = background_keys.get(background_key)
+        descriptor = cv.resize(signature, (4, 4), interpolation=cv.INTER_AREA).astype(np.float32).ravel() / 255
+        if background_index is None and backgrounds:
+            distances = np.mean((background_descriptors[:len(backgrounds)] - descriptor) ** 2, axis=1)
+            possible = np.flatnonzero(distances <= (config.global_dedup_rms_threshold + 2 / 255) ** 2)
+            background_index = next((int(i) for i in possible
+                                     if _strict_region_equal(signature, backgrounds[i], config)), None)
+        if background_index is None:
+            background_index = len(backgrounds)
+            uniform = bool(np.all(signature == signature[0, 0]))
+            weak_background = uniform and any(ref.shape[:2] == (1, 1)
+                                               and np.abs(ref[0, 0].astype(np.int16) - signature[0, 0]).max() <= 8
+                                               for ref in backgrounds)
+            backgrounds.append(signature[:1, :1].copy() if np.all(signature == signature[0, 0]) else signature)
+            background_descriptors[background_index] = descriptor
+            key = f'b{background_index:04d}'
+            analysis.units[key] = {'id': key, 'kind': 'background', 'weight': 0.0 if weak_background else .15}
+        background_keys[background_key] = background_index
+        background_id = f'b{background_index:04d}'
+        analysis.units.setdefault(background_id, {'id': background_id, 'kind': 'background', 'weight': .15})
+        analysis.coverage[identity].add(background_id)
+        analysis.quality[identity] = (sum(exposures), -sum(clipped_edges),
+                                      round(sum(sharpness) / max(1, len(sharpness)), 4), -sum(motion))
+        analysis.descriptors[identity] = cv.resize(small, (12, 20), interpolation=cv.INTER_AREA).astype(np.float32) / 255
+        analysis.details[identity] = {'regions': regions, 'background_id': background_id,
+                                      'note': '局部区域和裁切线索，不代表已识别弹窗用途或确认完整性'}
+        # 活跃跟踪最多保存 32 份参考图；更早的内容只留覆盖区间和记录。
+        active = sorted((track for track in tracks if track.pixels is not None),
+                        key=lambda t: (t.last_index, t.index))
+        for old in active[:-32]:
+            old.bins = _local_track_bins(old, config)
+            old.pixels = None
+            old.gray = None
+    for track in tracks:
+        bins = _local_track_bins(track, config)
+        for number, rows in bins:
+            key = f'r{track.index:04d}:{number}'
+            analysis.units[key] = {'id': key, 'kind': track.kind, 'track': track.index,
+                                   'weight': (1.5 if track.kind == 'local' else 1.0) / len(bins) if track.reliable else 0.0,
+                                   'range': [int(rows.min()), int(rows.max()) + 1]}
+            for observation in track.observations:
+                if float(np.mean((rows >= observation['top']) & (rows < observation['bottom']))) >= .8:
+                    analysis.coverage[id(observation['candidate'])].add(key)
+    anchors = {id(c) for c in _selection_anchors(candidates, 15)}
+    def rank(candidate):
+        coverage = analysis.coverage[id(candidate)]
+        return (sum(analysis.units[key]['weight'] for key in coverage), len(coverage),
+                *analysis.quality[id(candidate)], candidate.support_s, candidate.time)
+    ordered = sorted(candidates, key=rank, reverse=True)
+    # 固定参考的直接覆盖关系，不沿被删除图片串联合并；首尾始终保留候选资格。
+    for candidate in ordered:
+        identity = id(candidate)
+        covering = next((rep for rep in analysis.representatives
+                         if analysis.coverage[identity] <= analysis.coverage[id(rep)]), None)
+        if identity not in anchors and covering is not None:
+            analysis.replacements[identity] = covering
         else:
-            other = nearest_to[id(candidate)]
-            _note(candidate, "内容名额已满，优先覆盖不同页面及差异更大的内容", [other],
-                  frame_limit=limit, page=candidate.page_id + 1,
-                  distance_to_retained=nearest[id(candidate)],
-                  note="相关图是最相近的已选画面，不表示全部内容都相同或已完整覆盖")
+            analysis.representatives.append(candidate)
+    analysis.representatives.sort(key=lambda c: c.time)
+    for candidate in candidates:
+        identity = id(candidate)
+        candidate.evidence_ids = tuple(sorted(analysis.coverage[identity]))
+        details = {**analysis.details[identity], 'coverage_ids': list(candidate.evidence_ids)}
+        if identity in analysis.replacements:
+            representative = analysis.replacements[identity]
+            _note(candidate, '同一内容换用展示更充分或更清楚的代表图', [representative], **details)
+        else:
+            _note(candidate, '保留独立内容或互补范围的候选，尚未占用最终名额', **details)
+    return analysis
+
+
+def _limit_candidates(candidates, limit, *, config=None, analysis=None):
+    """按尚未覆盖的内容选图，内容覆盖完即停；上限不是目标张数。"""
+    config = config or KeyframeConfig()
+    limit = min(15, limit)
+    analysis = analysis or _analyze_local_content(candidates, config)
+    selected = _selection_anchors(list(candidates), limit)
+    selected_ids = {id(c) for c in selected}
+    covered = set().union(*(analysis.coverage[id(c)] for c in selected)) if selected else set()
+    required = {key for key, unit in analysis.units.items() if unit['weight'] > 0}
+    rounds = {}
+    while len(selected) < limit:
+        remaining = [c for c in analysis.representatives if id(c) not in selected_ids]
+        def gain(candidate):
+            return sum(analysis.units[key]['weight'] for key in analysis.coverage[id(candidate)] - covered)
+        useful = [c for c in remaining if gain(c) > 1e-9]
+        if not useful:
+            break
+        def rank(candidate):
+            descriptor = analysis.descriptors[id(candidate)]
+            novelty = min((float(np.mean((descriptor - analysis.descriptors[id(c)]) ** 2))
+                           for c in selected), default=1.0)
+            return (gain(candidate), *analysis.quality[id(candidate)], novelty,
+                    candidate.support_s, candidate.time)
+        best = max(useful, key=rank)
+        rounds[id(best)] = {'round': len(selected) + 1, 'new_content_weight': round(gain(best), 6)}
+        selected.append(best)
+        selected_ids.add(id(best))
+        covered.update(analysis.coverage[id(best)])
+    uncovered = required - covered
+    uncertain = {key for key, unit in analysis.units.items() if unit['weight'] == 0} - covered
+    hit = bool(uncovered) and len(selected) >= limit
+    reason = 'limit_reached' if hit else ('covered' if not uncovered and not uncertain else 'no_reliable_addition')
+    analysis.summary = {'policy': 'adaptive-local-v1', 'limit': limit, 'stop_reason': reason, 'hit_limit': hit,
+                        'input_count': len(analysis.candidates), 'representative_count': len(analysis.representatives),
+                        'identified_content_count': len(required), 'covered_content_count': len(required & covered),
+                        'uncovered_count': len(uncovered),
+                        'uncertain_content_count': len(uncertain),
+                        'uncovered_content': [analysis.units[key] for key in sorted(uncovered)],
+                        'selected_before_dedup': len(selected)}
+    for candidate in candidates:
+        identity = id(candidate)
+        missing = analysis.coverage[identity] - covered
+        common = [c for c in selected if c is not candidate
+                  and analysis.coverage[identity] & analysis.coverage[id(c)]]
+        details = {'frame_limit': limit, 'coverage_ids': list(candidate.evidence_ids),
+                   'uncovered_ids': sorted(missing), 'stop_reason': reason}
+        if identity in selected_ids:
+            _note(candidate, '保留任务首帧或结束位置' if identity not in rounds
+                  else '覆盖尚未展示的局部内容或整体状态', **details, **rounds.get(identity, {}))
+        elif identity in analysis.replacements:
+            _note(candidate, '同一内容已换用展示更充分的代表图', [analysis.replacements[identity]], **details)
+        elif not missing:
+            _note(candidate, '此帧识别到的内容已由所选图片覆盖，不补图凑数', common, **details)
+        elif hit:
+            _note(candidate, f'达到 {limit} 张上限，此帧仍有内容未覆盖', selected[-1:],
+                  last_selected_comparison=rounds.get(id(selected[-1]), {}),
+                  new_content_weight=round(sum(analysis.units[key]['weight'] for key in missing), 6), **details)
+        else:
+            _note(candidate, '未发现可靠新增内容，停止增加图片', common, **details)
     return sorted(selected, key=lambda c: c.time)
 
 
@@ -1170,7 +1685,12 @@ def _final_deduplicate(
                            "not_merged_because": failed}
             checks.append(check)
             comparisons.append((representative, check))
-            if similar:
+            different_evidence = (bool(candidate.evidence_ids)
+                                  and not set(candidate.evidence_ids) <= set(representative.evidence_ids))
+            if similar and different_evidence:
+                check['different_local_evidence'] = True
+                check['not_merged_because'].append('包含不同的局部内容或互补范围')
+            if similar and not different_evidence:
                 matches.append(representative)
         details = {"scope": "all_final_candidates", "comparisons": checks,
                    "rms_threshold": config.global_dedup_rms_threshold,
@@ -1207,13 +1727,14 @@ def _hybrid_keyframes(
     work_dir: Path,
     config: KeyframeConfig,
     duration: float,
-) -> tuple[list[_Candidate], list[_Candidate], float | None, float | None]:
+) -> tuple[list[_Candidate], list[_Candidate], float | None, float | None, dict]:
     effective_task_end, raw = _extract_candidates(
         video,
         work_dir,
         config,
         duration,
     )
+    _prewarm_features(raw, _content_signature)
     _stage("collected", "最初收集", [], raw)
     terminal_candidates = [
         candidate
@@ -1274,6 +1795,7 @@ def _hybrid_keyframes(
     _stage("range", "确定任务范围", all_timestamp_unique + terminal_candidates,
            timestamp_unique + terminal_candidates)
     state_unique = _deduplicate_states(timestamp_unique, config)
+    state_kept_ids = {id(candidate) for candidate in state_unique}
     for candidate in terminal_candidates:
         _note(candidate, "视频末帧单独保留，暂不参与页面合并")
     _stage("states", "合并重复页面", timestamp_unique + terminal_candidates,
@@ -1311,17 +1833,31 @@ def _hybrid_keyframes(
     _stage("endpoints", "保留任务首尾", before_forced, combined_ordered)
     content_unique = _merge_repeated_content(combined_ordered, config)
     _stage("content", "合并重复内容", combined_ordered, content_unique)
-    limited = _limit_candidates(content_unique, config.max_frames, config=config)
-    _stage("budget", "按内容分配图片名额", content_unique, limited)
+    content_kept_ids = {id(candidate) for candidate in content_unique}
+    review = [candidate for candidate in timestamp_unique if id(candidate) not in state_kept_ids]
+    review += [candidate for candidate in combined_ordered if id(candidate) not in content_kept_ids]
+    review = [candidate for candidate in review if candidate is task_end_candidate
+              or not terminal_candidates or abs(candidate.time - terminal_candidates[-1].time) > .5]
+    local_pool, review_summary = _review_merged_content(content_unique, review, config)
+    _stage('review', '复核前段相近内容', sorted(content_unique + review, key=lambda c: c.time), local_pool)
+    analysis = _analyze_local_content(local_pool, config)
+    _stage("local", "检查局部内容与代表图", local_pool, analysis.representatives)
+    limited = _limit_candidates(analysis.representatives, config.max_frames, config=config, analysis=analysis)
+    _stage("budget", "按新增内容自适应选图", analysis.representatives, limited)
     selected, removed = _final_deduplicate(limited, config)
     _stage("final", "全局去除高度重复 · 最终结果", limited, selected)
-    return selected, removed, effective_task_end, task_end_confidence
+    analysis.summary['selected_after_dedup'] = len(selected)
+    analysis.summary['merged_content_review'] = review_summary
+    recorder = _PROCESS.get()
+    if recorder is not None:
+        recorder.selection = analysis.summary
+    return selected, removed, effective_task_end, task_end_confidence, analysis.summary
 
 
 def extract_scene_keyframes(
     video: Path | str,
     out_dir: Path | str,
-    max_frames: int = 25,
+    max_frames: int = 15,
     min_frames: int = 4,
     threshold: float = 0.02,
     min_gap_s: float = 0.15,
@@ -1368,7 +1904,7 @@ def extract_scene_keyframes(
     metadata_path.unlink(missing_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="ae_kf_candidates_") as temp_dir:
-        selected, removed, effective_task_end, confidence = _hybrid_keyframes(
+        selected, removed, effective_task_end, confidence, selection = _hybrid_keyframes(
             video,
             Path(temp_dir),
             config,
@@ -1386,6 +1922,7 @@ def extract_scene_keyframes(
                     "time": round(candidate.time, 3),
                     "source": candidate.source,
                     "keep_reason": candidate.keep_reason,
+                    "evidence_ids": list(candidate.evidence_ids),
                 }
             )
 
@@ -1403,6 +1940,7 @@ def extract_scene_keyframes(
                 round(confidence, 5) if confidence is not None else None
             ),
             "selected_count": len(records),
+            "selection": selection,
             "selected": records,
             "final_dedup_removed_count": len(removed),
             "final_dedup_removed": [
@@ -1448,7 +1986,7 @@ def encode_frame(
 def video_to_frame_urls(
     video: Path | str,
     out_dir: Path | str | None = None,
-    max_frames: int = 25,
+    max_frames: int = 15,
     min_frames: int = 4,
     threshold: float = 0.02,
     min_gap_s: float = 0.15,

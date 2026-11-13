@@ -103,7 +103,7 @@ def test_feature_cache_is_bounded_and_cleared_on_failure():
     assert media._FEATURE_KEYS.get() is None
 
 
-def test_budget_does_not_recalculate_nearest_retained_images(tmp_path, monkeypatch):
+def test_local_analysis_reads_each_candidate_once(tmp_path, monkeypatch):
     candidates = []
     random = np.random.default_rng(42)
     for index in range(40):
@@ -111,13 +111,48 @@ def test_budget_does_not_recalculate_nearest_retained_images(tmp_path, monkeypat
         Image.fromarray(random.integers(0, 256, (160, 96, 3), dtype=np.uint8)).save(path)
         candidates.append(media._Candidate(index, path, "4fps", page_id=index % 6))
     calls = []
-    original = media._content_difference
+    original = Image.open
 
     def counted(*args):
         calls.append(1)
         return original(*args)
 
-    monkeypatch.setattr(media, "_content_difference", counted)
+    monkeypatch.setattr(Image, "open", counted)
     selected = media._limit_candidates(candidates, 10)
     assert len(selected) == 10
-    assert len(calls) < len(candidates) * 10
+    assert len(calls) == len(candidates)
+
+
+def test_small_feature_cache_has_its_own_bound_and_is_released():
+    @media._cached_feature
+    def _layout_signature(path):
+        return object()
+
+    @media._with_feature_cache
+    def run():
+        for index in range(4200):
+            _layout_signature(Path(str(index)))
+        assert len(media._SMALL_FEATURES.get()) == 4096
+        assert not media._FEATURES.get()
+    run()
+    assert media._SMALL_FEATURES.get() is None
+
+
+def test_parallel_features_match_scalar_pixels_and_share_identical_files(tmp_path):
+    random = np.random.default_rng(7)
+    candidates = []
+    for index in range(12):
+        path = tmp_path / f'{index}.png'
+        Image.fromarray(random.integers(0, 256, (160, 96, 3), dtype=np.uint8)).save(path)
+        candidates.append(media._Candidate(index, path, '4fps'))
+    candidates[3].path.write_bytes(candidates[0].path.read_bytes())
+
+    @media._with_feature_cache
+    def run():
+        for function in (media._content_signature, media._layout_signature):
+            scalar = [function.__wrapped__(candidate.path) for candidate in candidates]
+            media._prewarm_features(candidates, function)
+            for candidate, expected in zip(candidates, scalar):
+                np.testing.assert_array_equal(function(candidate.path), expected)
+            assert function(candidates[0].path) is function(candidates[3].path)
+    run()

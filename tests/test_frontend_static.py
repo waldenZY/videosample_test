@@ -1,0 +1,32 @@
+"""不启动服务，检查新旧结果的统计和停止原因能被前端渲染。"""
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+
+def test_adaptive_statistics_and_legacy_records_render_without_server():
+    node = shutil.which('node')
+    if node is None:
+        pytest.skip('Node 仅用于前端回归，不是平台运行依赖')
+    root = Path(__file__).resolve().parents[1]
+    script = r'''
+const fs=require('fs'), vm=require('vm'), assert=require('assert');
+const elements=new Map();
+function element(id){if(!elements.has(id))elements.set(id,{hidden:false,innerHTML:'',textContent:'',value:'',open:false});return elements.get(id);}
+const context={document:{getElementById:element},fetch:()=>new Promise(()=>{}),setTimeout:()=>0,clearTimeout:()=>{}};
+vm.createContext(context);vm.runInContext(fs.readFileSync('static/app.js','utf8'),context);
+vm.runInContext(`renderSelection({frame_count:14,selection:{limit:15,representative_count:18,selected_after_dedup:14,uncovered_count:3,stop_reason:'limit_reached'}})`,context);
+assert.equal(element('selectionInfo').hidden,false);
+assert(element('selectionInfo').innerHTML.includes('达到张数上限'));
+vm.runInContext(`traceData={stages:[{id:'budget',title:'自适应选图',input_ids:[],output_ids:[],removed_ids:[],events:[]}],frames:[]}`,context);
+element('showMissingFrames').onclick();assert.equal(element('frameFilter').value,'dropped');
+vm.runInContext('renderSelection({frame_count:10})',context);assert.equal(element('selectionInfo').hidden,true);
+const value=context.renderDistribution({output_distribution:{samples:2,counts:{'1-5':1,'6-10':0,'11-14':1,'15':0,other:0}},adaptive_selection:{samples:2,hit_limit_count:1,hit_limit_rate:.5,stop_reasons:{covered:1,no_reliable_addition:0,limit_reached:1}}});
+assert(value.includes('50.0%'));assert(value.includes('11-14 张：1 题'));
+assert(context.renderDistribution({}).includes('暂无张数分布'));
+const html=fs.readFileSync('static/index.html','utf8');
+assert(html.includes('自适应，最多 15 张'));assert(html.includes('数量分布 / 停止情况'));
+'''
+    subprocess.run([node, '-e', script], cwd=root, check=True, capture_output=True, text=True, timeout=15)

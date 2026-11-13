@@ -205,7 +205,7 @@ def test_xlsx_batch_api(tmp_path, monkeypatch, video):
         assert recovered["rows"][0]["status"] == "interrupted"
 
 
-@pytest.mark.parametrize("limit", [5, 10])
+@pytest.mark.parametrize("limit", [5, 10, 15])
 def test_paired_chains_have_independent_steps(tmp_path, monkeypatch, video, limit):
     monkeypatch.setattr(server, "RUNS", tmp_path / "runs")
 
@@ -237,6 +237,10 @@ def test_paired_chains_have_independent_steps(tmp_path, monkeypatch, video, limi
         assert base["algorithm"]["key"] == "base" and other["algorithm"]["key"] == "current"
         assert base["rows"][0]["effective_config"]["max_frames"] == 20
         assert other["rows"][0]["effective_config"]["max_frames"] == limit
+        assert other['rows'][0]['selection']['policy'] == 'adaptive-local-v1'
+        assert other['rows'][0]['selection']['selected_after_dedup'] == other['rows'][0]['frame_count']
+        trace = client.get(f"/api/runs/{other_id}/items/0/trace").json()
+        assert trace['selection'] == other['rows'][0]['selection']
         assert base["rows"][0]["stages"][-1]["id"] == "final"
         assert other["rows"][0]["stages"] == [{"id": "experiment_custom", "title": "实验自定义步骤"}]
         assert (tmp_path / "runs" / base["id"] / "algorithm.py").is_file()

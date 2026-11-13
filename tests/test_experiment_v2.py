@@ -48,7 +48,7 @@ def test_incremental_content_changes_do_not_all_drift_into_one_group(tmp_path):
     assert len(groups) > 3
 
 
-def test_number_budget_covers_pages_and_does_not_exempt_protected_frames(tmp_path):
+def test_number_budget_is_hard_and_does_not_exempt_protected_frames(tmp_path):
     random = np.random.default_rng(40)
     candidates = []
     for i in range(100):
@@ -58,8 +58,7 @@ def test_number_budget_covers_pages_and_does_not_exempt_protected_frames(tmp_pat
                                            support_s=0.25, page_id=i % 10))
     config = media.KeyframeConfig()
     selected = media._limit_candidates(candidates, config.max_frames, config=config)
-    assert len(selected) == 25
-    assert {c.page_id for c in selected} == set(range(10))
+    assert len(selected) == 15
     assert candidates[0] in selected
 
 
@@ -77,7 +76,7 @@ def test_short_card_is_not_displaced_by_a_long_wait_on_same_page(tmp_path):
     assert needed in media._limit_candidates(sorted(pool, key=lambda c: c.time), 3)
 
 
-@pytest.mark.parametrize("limit", [2, 3, 25])
+@pytest.mark.parametrize("limit", [2, 3, 15])
 def test_end_positions_share_the_same_budget(tmp_path, limit):
     candidates = [media._Candidate(i, card(tmp_path / f"{i}.jpg", 30 + i * 20), "4fps", page_id=i)
                   for i in range(8)]
@@ -88,7 +87,7 @@ def test_end_positions_share_the_same_budget(tmp_path, limit):
     assert candidates[0] in selected and candidates[-2] in selected
 
 
-@pytest.mark.parametrize("limit", [5, 10, 25])
+@pytest.mark.parametrize("limit", [5, 10, 15])
 def test_long_animated_video_stays_within_limit_and_trace_explains_selection(tmp_path, limit):
     video = tmp_path / "animated.mp4"
     subprocess.run([media.resolve_ffmpeg_executable(), "-y", "-v", "error", "-f", "lavfi", "-i",
@@ -105,6 +104,6 @@ def test_long_animated_video_stays_within_limit_and_trace_explains_selection(tmp
     assert len(budget["output_ids"]) <= limit
     assert any(event["status"] == "dropped" and event["related"] for event in budget["events"])
     metadata = json.loads((tmp_path / "final/keyframes.json").read_text(encoding="utf-8"))
-    assert metadata["algorithm_version"] == "hybrid-state-exp-v3"
+    assert metadata["algorithm_version"] == "hybrid-state-exp-v4"
     assert metadata["config"]["max_frames"] == limit
     assert base_media.KeyframeConfig().max_frames == 20

@@ -29,6 +29,30 @@ def test_empty_and_zero_statistics():
     assert stats["initial_frames"] == {"samples": 1, "total": 0, "mean": 0}
 
 
+def test_output_distribution_and_hit_limit_use_actual_stop_reason():
+    rows = []
+    for count, reason, seconds in [(4, 'covered', 3), (15, 'limit_reached', 26),
+                                   (14, 'limit_reached', 12), (8, 'no_reliable_addition', 5)]:
+        rows.append({'status': 'done', 'frame_count': count, 'selection': {'stop_reason': reason},
+                     'timings_s': {'extraction': seconds}})
+    rows += [{'status': 'done', 'frame_count': 10},
+             {'status': 'error', 'frame_count': 15, 'selection': {'stop_reason': 'limit_reached'}}]
+    stats = server.chain_statistics({'rows': rows})
+    assert stats['output_distribution'] == {'samples': 5, 'counts':
+            {'1-5': 1, '6-10': 2, '11-14': 1, '15': 1, 'other': 0}}
+    assert stats['adaptive_selection']['samples'] == 4
+    assert stats['adaptive_selection']['hit_limit_count'] == 2
+    assert stats['adaptive_selection']['hit_limit_rate'] == .5
+    assert stats['extraction_max_s'] == 26
+
+
+def test_exactly_15_with_all_content_covered_is_not_limit_stopped():
+    stats = server.chain_statistics({'rows': [{'status': 'done', 'frame_count': 15,
+                                              'selection': {'stop_reason': 'covered', 'hit_limit': False}}]})
+    assert stats['output_distribution']['counts']['15'] == 1
+    assert stats['adaptive_selection']['hit_limit_rate'] == 0
+
+
 def test_batch_api_returns_independent_statistics_for_each_chain(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "RUNS", tmp_path / "runs")
     ids = {"base": "a" * 32, "current": "b" * 32}

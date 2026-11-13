@@ -29,6 +29,8 @@ def snapshot(key, *, max_frames=None):
             "defaults": asdict(module.KeyframeConfig())}
     if key == "current" and max_frames is not None:
         result["overrides"] = {"max_frames": max_frames}
+    if key == "current":
+        result['selection_policy'] = 'adaptive-local-v1'
     return result
 
 

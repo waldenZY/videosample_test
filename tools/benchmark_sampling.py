@@ -14,7 +14,7 @@ from videosample import algorithms, media
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("videos", nargs="+", type=Path)
-    parser.add_argument("--limits", nargs="+", type=int, choices=[5, 10], default=[5, 10])
+    parser.add_argument("--limits", nargs="+", type=int, choices=[5, 10, 15], default=[15])
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--output", type=Path, default=Path("runs/benchmarks"))
     args = parser.parse_args()
@@ -36,6 +36,7 @@ def main():
                           "initial_frame_count": recorder.initial_frame_count,
                           "timings_s": recorder.timing_summary(),
                           "algorithm": algorithms.snapshot("current", max_frames=limit)}
+                result['selection'] = recorder.selection
                 results.append(result)
                 (directory / "results.json").write_text(
                     json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")

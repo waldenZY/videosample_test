@@ -142,8 +142,8 @@ def import_table(file: UploadFile = File(...)):
     run = {"id": identity, "name": Path(filename).stem,
            "filename": filename, "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
            "version": algorithms.snapshot("current")["algorithm_version"],
-           "algorithm": algorithms.snapshot("current", max_frames=10), "run_mode": "current",
-           "experiment_max_frames": 10, "status": "imported",
+           "algorithm": algorithms.snapshot("current", max_frames=15), "run_mode": "current",
+           "experiment_max_frames": 15, "status": "imported",
            "warnings": warnings, "errors": errors, "sheet": sheet, "summary": summary,
            "rows": [{"index": index, "item": item, "status": "ready", "message": "等待开始"}
                     for index, item in enumerate(items)]}
@@ -190,12 +190,33 @@ def chain_statistics(run):
         return {"samples": len(valid), "total": round(sum(valid), 3) if valid else None,
                 "mean": round(sum(valid) / len(valid), 3) if valid else None}
 
+    durations = [(row.get('timings_s') or {}).get('extraction') for row in successful]
+    durations = [float(value) for value in durations if isinstance(value, Real)
+                 and not isinstance(value, bool) and math.isfinite(value) and value >= 0]
+    distribution = {'1-5': 0, '6-10': 0, '11-14': 0, '15': 0, 'other': 0}
+    distribution_samples = 0
+    for row in successful:
+        value = row.get('frame_count')
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            continue
+        bucket = '1-5' if 1 <= value <= 5 else '6-10' if 6 <= value <= 10 else '11-14' if 11 <= value <= 14 else '15' if value == 15 else 'other'
+        distribution[bucket] += 1
+        distribution_samples += 1
+    selections = [row['selection'] for row in successful if isinstance(row.get('selection'), dict)
+                  and row['selection'].get('stop_reason') in {'covered', 'no_reliable_addition', 'limit_reached'}]
+    reasons = {key: sum(selection['stop_reason'] == key for selection in selections)
+               for key in ('covered', 'no_reliable_addition', 'limit_reached')}
     return {"total_samples": len(rows),
             "selected_samples": sum(row.get("status") != "skipped" for row in rows),
             "successful_samples": len(successful),
             "failed_samples": sum(row.get("status") in {"error", "interrupted"} for row in rows),
             "sample_time_s": metric(row.get("elapsed_s") for row in successful),
             "extraction_time_s": metric((row.get("timings_s") or {}).get("extraction") for row in successful),
+            "extraction_max_s": round(max(durations), 3) if durations else None,
+            "output_distribution": {'samples': distribution_samples, 'counts': distribution},
+            "adaptive_selection": {'samples': len(selections), 'stop_reasons': reasons,
+                                   'hit_limit_count': reasons['limit_reached'],
+                                   'hit_limit_rate': round(reasons['limit_reached'] / len(selections), 4) if selections else None},
             "initial_frames": metric(row.get("initial_frame_count", (row.get("stage_counts") or {}).get("collected"))
                                      for row in successful),
             "final_frames": metric(row.get("frame_count") for row in successful)}
@@ -219,7 +240,7 @@ class StartRequest(BaseModel):
     indices: list[int] | None = None
     name: str = ""
     run_mode: Literal["base", "current", "both"] = "both"
-    experiment_max_frames: Literal[5, 10] = 10
+    experiment_max_frames: Literal[5, 10, 15] = 15
 
 
 @app.post("/api/runs/{identity}/start")
@@ -266,7 +287,7 @@ def copy_run(identity: str):
     run["rows"] = [{"index": row["index"], "item": row["item"], "status": "ready", "message": "等待开始"}
                    for row in run["rows"]]
     run["run_mode"] = run.get("run_mode", "current")
-    run["experiment_max_frames"] = run.get("experiment_max_frames", 10)
+    run["experiment_max_frames"] = 15
     run["algorithm"] = algorithms.snapshot("current" if run["run_mode"] == "current" else "base",
                                            max_frames=run["experiment_max_frames"])
     run["version"] = run["algorithm"]["algorithm_version"]
@@ -335,6 +356,7 @@ def process_row(identity: str, index: int):
         update_row(identity, index, status="done", message="抽帧完成", frame_count=len(frames),
                    initial_frame_count=getattr(recorder, "initial_frame_count", counts.get("collected")),
                    effective_config=metadata["config"],
+                   selection=metadata.get('selection'),
                    stages=[{"id": stage["id"], "title": stage["title"]} for stage in recorder.stages],
                    stage_counts=counts, timings_s=timings, elapsed_s=round(time.monotonic() - started, 2))
     except Exception as exc:
