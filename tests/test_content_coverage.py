@@ -36,17 +36,6 @@ def test_different_local_text_keeps_independent_content(tmp_path):
     assert media._limit_candidates(candidates, 15) == candidates
 
 
-def test_strict_local_comparison_does_not_treat_similarity_as_transitive(tmp_path):
-    import numpy as np
-    config = media.KeyframeConfig(global_dedup_rms_threshold=1.5 / 255)
-    a = np.full((160, 96, 3), 40, dtype=np.uint8)
-    b = np.full_like(a, 41)
-    c = np.full_like(a, 42)
-    assert media._strict_local_equal(a, b, config)
-    assert media._strict_local_equal(b, c, config)
-    assert not media._strict_local_equal(a, c, config)
-
-
 def test_identical_endpoints_still_count_as_required_positions(tmp_path):
     start = frame(tmp_path, 'start', 0, 'white')
     ordinary = frame(tmp_path, 'ordinary', 20, 'white')

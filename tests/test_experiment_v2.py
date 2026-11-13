@@ -98,12 +98,12 @@ def test_long_animated_video_stays_within_limit_and_trace_explains_selection(tmp
                                               max_frames=limit)
     assert 2 <= len(frames) <= limit
     trace = json.loads((tmp_path / "process/trace.json").read_text(encoding="utf-8"))
-    assert len(trace["frames"]) > 100
+    assert trace['initial_frame_count'] >= 38 * media.KeyframeConfig().sample_fps - 2
     assert any(stage["id"] == "content" for stage in trace["stages"])
     budget = next(stage for stage in trace["stages"] if stage["id"] == "budget")
     assert len(budget["output_ids"]) <= limit
     assert any(event["status"] == "dropped" and event["related"] for event in budget["events"])
     metadata = json.loads((tmp_path / "final/keyframes.json").read_text(encoding="utf-8"))
-    assert metadata["algorithm_version"] == "hybrid-state-exp-v4.3"
+    assert metadata["algorithm_version"] == "hybrid-state-exp-v4.4"
     assert metadata["config"]["max_frames"] == limit
     assert base_media.KeyframeConfig().max_frames == 20

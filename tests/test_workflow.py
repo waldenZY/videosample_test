@@ -99,6 +99,16 @@ def test_merged_candidates_are_not_restored_by_later_stages(tmp_path, video, mon
     assert set(stages['budget']['output_ids']) <= set(expected)
 
 
+def test_experiment_default_sampling_has_third_second_spacing(tmp_path, video):
+    config = media.KeyframeConfig(task_start_time=0, task_end_time=13, protected_sample_interval=0)
+    assert config.sample_fps == 3
+    _, candidates = media._extract_candidates(video, tmp_path / 'candidates', config, 16)
+    samples = [c for c in candidates if c.source == '3fps']
+    assert len(samples) > 10
+    assert samples[0].time == pytest.approx(1 / 3)
+    assert all(abs(b.time - a.time - 1 / 3) < 1e-9 for a, b in zip(samples, samples[1:]))
+
+
 def test_base_defaults_and_output_match_original(tmp_path, video, baseline):
     assert asdict(base_media.KeyframeConfig()) == asdict(baseline.KeyframeConfig())
     original = baseline.extract_scene_keyframes(video, tmp_path / "old", task_end_time=13)

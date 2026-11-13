@@ -31,7 +31,7 @@ from pathlib import Path
 import numpy as np
 
 
-KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4.3"
+KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4.4"
 DEFAULT_TASK_START_TIME = 7.0
 
 # 仅供实验台记录过程；不参与任何选帧决策。定稿迁回时可整体移除。
@@ -309,7 +309,7 @@ class KeyframeConfig:
     task_start_time: float = DEFAULT_TASK_START_TIME
     task_end_time: float | None = None
     max_frames: int = 15
-    sample_fps: float = 4.0
+    sample_fps: float = 3.0
     scene_threshold: float = 0.02
     scene_min_gap_s: float = 0.15
     timestamp_merge_gap_s: float = 0.25
@@ -337,9 +337,6 @@ class KeyframeConfig:
     local_analysis_max_edge: int = 320
     local_template_threshold: float = 0.90
     local_content_bin_height: int = 24
-    local_recording_timer_mask: bool = True
-    local_recording_timer_box: tuple = (.63, .005, .74, .040)
-    local_scroll_alignment: bool = True
     # 受保护采样：在开头和结尾两个时间窗口内，每 interval 秒额外标记一帧，
     # 仅当画面高度一致时才去重（用于捕获弹窗/横幅/开场状态等开头结尾的小变化）。
     protected_sample_interval: float = 2.0  # 0 = 禁用；>0 则每 N 秒一帧
@@ -375,11 +372,6 @@ class KeyframeConfig:
             raise ValueError("局部分析尺寸或内容分段过小")
         if not 0 < self.local_template_threshold <= 1:
             raise ValueError("局部匹配阈值必须在 0 到 1 之间")
-        if (len(self.local_recording_timer_box) != 4
-                or not all(isinstance(v, Real) and math.isfinite(v) for v in self.local_recording_timer_box)
-                or not 0 <= self.local_recording_timer_box[0] < self.local_recording_timer_box[2] <= 1
-                or not 0 <= self.local_recording_timer_box[1] < self.local_recording_timer_box[3] <= 1):
-            raise ValueError("录屏计时区域必须是 0 到 1 的左、上、右、下坐标")
         if self.sample_fps <= 0:
             raise ValueError("sample_fps 必须大于 0")
         if self.max_edge <= 0:
@@ -1192,22 +1184,6 @@ def _strict_region_equal(left, right, config):
             and float(maximum.reshape(40, 4, 24, 4).mean(axis=(1, 3)).max()) < config.global_dedup_patch_threshold)
 
 
-def _strict_local_equal(left, right, config):
-    if not _strict_region_equal(left, right, config):
-        return False
-    cv = _local_cv()
-    mask = (np.max(np.abs(left.astype(np.int16) - right.astype(np.int16)), axis=2) >= 12).astype(np.uint8)
-    count, _, stats, _ = cv.connectedComponentsWithStats(mask, connectivity=8)
-    for x, y, w, h, area in stats[1:count]:
-        if area < 4:
-            continue
-        x0, y0 = max(0, x - 2), max(0, y - 2)
-        x1, y1 = min(left.shape[1], x + w + 2), min(left.shape[0], y + h + 2)
-        if not _strict_region_equal(left[y0:y1, x0:x1], right[y0:y1, x0:x1], config):
-            return False
-    return True
-
-
 def _local_boxes(rgb):
     """颜色块和矩形轮廓只是关注区域线索，不是业务卡片识别。"""
     cv = _local_cv()
@@ -1313,10 +1289,6 @@ def _locate_local_content(track, crop, config, crop_gray=None):
         right = crop[top - position:bottom - position, 2:-2]
         if not _strict_region_equal(left, right, config):
             continue
-        # 多个独立边缘才追加小字检查；单个加载圆点的重绘沿用原移动规则。
-        edge_count, _ = cv.connectedComponents(cv.Canny(cv.cvtColor(left, cv.COLOR_RGB2GRAY), 60, 160))
-        if edge_count >= 5 and not _strict_local_equal(left, right, config):
-            continue
         # 两幅有内容的图不能仅靠一段白底建立关系。
         if left.std() < 2 and (reference.std() >= 3 or crop.std() >= 3):
             continue
@@ -1370,204 +1342,6 @@ def _local_track_bins(track, config):
     return bins or [(0, np.array([track.origin + len(pixels) // 2]))]
 
 
-def _analysis_pixels(source, config):
-    """只处理分析副本；限定录屏布局的计时框，不屏蔽整个状态栏。"""
-    if not config.local_recording_timer_mask:
-        return source, []
-    cv = _local_cv()
-    height, width = source.shape[:2]
-    # 已知录屏布局：左上方红色录屏按钮，以及同一行的右侧计时。
-    # 未找到红色按钮时不套用这一位置假设，避免修改普通页面顶部内容。
-    strip = source[:max(1, round(height * .05)), :round(width * .4)]
-    red = ((strip[..., 0].astype(np.int16) - strip[..., 1] > 70)
-           & (strip[..., 0].astype(np.int16) - strip[..., 2] > 70)
-           & (strip[..., 0] > 150)).astype(np.uint8)
-    count, _, stats, _ = cv.connectedComponentsWithStats(red, connectivity=8)
-    if not any(.008 * height <= h <= .05 * height and .7 <= w / max(1, h) <= 1.4
-               and area >= w * h * .25 and .10 * width <= x <= .36 * width
-               for x, y, w, h, area in stats[1:count]):
-        return source, []
-    x0, y0, x1, y1 = config.local_recording_timer_box
-    box = [round(x0 * width), round(y0 * height), round(x1 * width), round(y1 * height)]
-    result = source.copy()
-    result[box[1]:box[3], box[0]:box[2]] = 0
-    return result, [box]
-
-
-def _screen_bands(pixels):
-    """提取有边缘的横向图案；保留原尺寸，移动前后不缩放字形。"""
-    cv = _local_cv()
-    gray = cv.cvtColor(pixels, cv.COLOR_RGB2GRAY)
-    edges = cv.Canny(gray, 60, 160)
-    # 彩色但亮度接近的按钮也必须留下比较线索。
-    for channel in (0, 2):
-        edges |= cv.Canny(pixels[..., channel], 60, 160)
-    active = np.count_nonzero(edges, axis=1) >= 4
-    runs, start = [], None
-    for row, on in enumerate([*active, False]):
-        if on and start is None:
-            start = row
-        elif not on and start is not None:
-            if runs and start - runs[-1][1] <= 4:
-                runs[-1] = (runs[-1][0], row)
-            else:
-                runs.append((start, row))
-            start = None
-    bands = []
-    for top, bottom in runs:
-        ys, xs = np.nonzero(edges[top:bottom])
-        if len(xs) >= 8:
-            bands.append((max(0, top - 2), min(len(pixels), bottom + 2),
-                          max(0, int(xs.min()) - 2), min(pixels.shape[1], int(xs.max()) + 3)))
-    return gray, bands
-
-
-def _aligned_band_equal(left, right):
-    """容忍高清画面移动重绘的两像素边缘偏差，检查新增笔画及内部颜色变化。"""
-    cv = _local_cv()
-    lg, rg = (cv.cvtColor(a, cv.COLOR_RGB2GRAY) for a in (left, right))
-    # 例如 3→8 的小数字变化可能只有一两个像素宽，但字内闭合区域变了；
-    # 不能让位移重绘容忍吞掉这种结构变化。
-    def holes(gray, threshold):
-        contours, hierarchy = cv.findContours((gray >= threshold).astype(np.uint8),
-                                             cv.RETR_CCOMP, cv.CHAIN_APPROX_SIMPLE)
-        return sum(h[3] >= 0 and cv.contourArea(contour) >= 4
-                   for contour, h in zip(contours, hierarchy[0])) if hierarchy is not None else 0
-    if all(holes(lg, threshold) != holes(rg, threshold) for threshold in (80, 175)):
-        return False
-    le, re = cv.Canny(lg, 100, 220), cv.Canny(rg, 100, 220)
-    kernel = np.ones((5, 5), np.uint8)
-    unmatched = ((le > 0) & (cv.dilate(re, kernel) == 0)) | ((re > 0) & (cv.dilate(le, kernel) == 0))
-    near_edge = cv.dilate(cv.Canny(lg, 60, 160) | cv.Canny(rg, 60, 160), kernel) > 0
-    delta = np.max(np.abs(left.astype(np.int16) - right.astype(np.int16)), axis=2)
-    changed = unmatched | ((delta > 24) & ~near_edge)
-    count, _, stats, _ = cv.connectedComponentsWithStats(changed.astype(np.uint8), connectivity=8)
-    return not any(area >= 4 for x, y, w, h, area in stats[1:count])
-
-
-def _screen_matches(reference, candidate, config):
-    """找共同滚动的多行图案；未匹配的按钮、文字仍是独立内容。"""
-    cv = _local_cv()
-    rp, rg, rb = reference
-    cp, cg, cb = candidate
-    if rp.shape != cp.shape or not cb or not rb:
-        return None
-    if np.max(np.abs(np.median(rp[::8, ::8], axis=(0, 1)) - np.median(cp[::8, ::8], axis=(0, 1)))) > 16:
-        return None
-    used, shifts, matches = [], [], []
-    for number, (top, bottom, left, right) in enumerate(cb):
-        patch = cp[top:bottom, left:right]
-        # 同位置先核对，固定标题、输入栏不需要模板搜索。
-        exact = _strict_region_equal(rp[top:bottom, left:right], patch, config)
-        position = top if exact or _aligned_band_equal(rp[top:bottom, left:right], patch) else None
-        band_approximate = not exact
-        if position is None:
-            result = cv.matchTemplate(rg[:, left:right], cg[top:bottom, left:right], cv.TM_CCOEFF_NORMED)
-            _, score, _, (_, y) = cv.minMaxLoc(result)
-            if score < .85 or not _aligned_band_equal(rp[y:y + len(patch), left:right], patch):
-                continue
-            position = y
-            band_approximate = not _strict_region_equal(rp[y:y + len(patch), left:right], patch, config)
-        if any(max(a, position) < min(b, position + len(patch)) - 2 for a, b in used):
-            continue  # 不允许重复出现的多行内容共用同一参考行。
-        used.append((position, position + len(patch)))
-        if abs(position - top) > 2:
-            shifts.append(position - top)
-        ref_number = max(range(len(rb)), key=lambda i: min(rb[i][1], position + len(patch)) - max(rb[i][0], position))
-        overlap = min(rb[ref_number][1], position + len(patch)) - max(rb[ref_number][0], position)
-        if overlap >= len(patch) * .7:
-            matches.append((number, ref_number, position - top, band_approximate))
-    if not shifts and len(matches) == len(cb) and all(not approximate for n, r, delta, approximate in matches):
-        return {'vertical_shift': 0, 'matches': [(n, r) for n, r, delta, approximate in matches]}
-    if len(shifts) < 3 or cp.shape[1] < 480:
-        return None
-    # 至少三条图案共同移动；共享的每一条仍须通过颜色与结构检查。
-    shift = max(shifts, key=lambda v: sum(abs(v - other) <= 2 for other in shifts))
-    matches = [(n, r) for n, r, delta, approximate in matches
-               if abs(delta) <= 2 or abs(delta - shift) <= 2]
-    moving = sum(abs(cb[n][0] - rb[r][0]) > 2 for n, r in matches)
-    if moving < 3 or len(matches) < min(len(cb), len(rb)) * .5:
-        return None
-    return {'vertical_shift': int(shift), 'matches': matches}
-
-
-def _scroll_coverage(analysis, config, candidate, pixels, references, overrides, index):
-    """复用本轮已解码图片，固定参考逐条登记正文与独立变化。"""
-    if not config.local_scroll_alignment or pixels.shape[1] < 480:
-        return
-    cv = _local_cv()
-    preview = cv.resize(pixels, (180, max(1, round(len(pixels) * 180 / pixels.shape[1]))),
-                        interpolation=cv.INTER_AREA)
-    colors = preview.astype(np.int32) // 16
-    color_keys = colors[..., 0] * 256 + colors[..., 1] * 16 + colors[..., 2]
-    if np.bincount(color_keys.ravel(), minlength=4096).max() < color_keys.size * .25:
-        return  # 没有占主要面积的界面底色时，不假定它是可滚动的文字页面。
-    preview_edges = cv.Canny(cv.cvtColor(preview, cv.COLOR_RGB2GRAY), 60, 160)
-    if np.mean(np.count_nonzero(preview_edges, axis=1) >= 4) > .8:
-        return  # 持续密集运动画面没有可分离的正文行，沿用原局部检查。
-    screen = (pixels, *_screen_bands(pixels))
-    if not 4 <= len(screen[2]) <= 64:
-        return
-    matched = None
-    for reference in references:
-        if len(reference['patches']) + len(screen[2]) > 256:
-            continue
-        details = _screen_matches(reference['screen'], screen, config)
-        if details is not None:
-            matched = reference, details
-            break
-    if matched is not None:
-        reference, details = matched
-        root = reference['candidate']
-        prefix = f's{reference["index"]:04d}'
-        bands = reference['screen'][2]
-        if not reference['active']:
-            reference['active'] = True
-            overrides[id(root)] = {f'{prefix}:{i}' for i in range(len(bands))}
-            for i, (top, bottom, left, right) in enumerate(bands):
-                reference['patches'].append((reference['screen'][0][top:bottom, left:right],
-                                             (top, bottom, left, right), (top, bottom, left, right)))
-                analysis.units[f'{prefix}:{i}'] = {'id': f'{prefix}:{i}', 'kind': 'scroll-band',
-                                                  'weight': 1.5 / len(bands)}
-        mapping = dict(details['matches'])
-        shift = details['vertical_shift']
-        moving_rows = [screen[2][n][0] for n, r in details['matches']
-                       if abs(screen[2][n][0] - bands[r][0]) > 2]
-        covered = set()
-        for number, box in enumerate(screen[2]):
-            found = mapping.get(number)
-            if found is None:
-                top, bottom, left, right = box
-                moving = moving_rows and min(moving_rows) - 60 <= top <= max(moving_rows) + 120
-                normalized = (top + shift, bottom + shift, left, right) if moving else box
-                patch = pixels[top:bottom, left:right]
-                # 新状态只与固定的首次像素核对，不能沿后续近似图片串联。
-                for i, (old_patch, old_box, old_normalized) in enumerate(reference['patches']):
-                    ot, ob, ol, oright = old_box
-                    if (max(abs(left - ol), abs(right - oright)) > 2 or abs((bottom - top) - (ob - ot)) > 2
-                            or abs(normalized[0] - old_normalized[0]) > 3):
-                        continue
-                    compared = old_patch if old_patch.shape == patch.shape else _local_cv().resize(
-                        old_patch, (patch.shape[1], patch.shape[0]), interpolation=_local_cv().INTER_AREA)
-                    if (_strict_region_equal(compared, patch, config)
-                            or _aligned_band_equal(compared, patch)):
-                        found = i
-                        break
-            if found is None:
-                found = len(reference['patches'])
-                reference['patches'].append((patch.copy(), box, normalized))
-                key = f'{prefix}:{found}'
-                analysis.units[key] = {'id': key, 'kind': 'scroll-band', 'weight': 1.5 / len(bands)}
-            covered.add(f'{prefix}:{found}')
-        overrides[id(candidate)] = covered
-        analysis.details[id(candidate)]['scroll_comparison'] = {
-            'reference_time': root.time, 'vertical_shift': details['vertical_shift'],
-            'shared_bands': len(details['matches']), 'independent_bands': len(covered) - len(set(mapping.values()))}
-    else:
-        references.insert(0, {'candidate': candidate, 'screen': screen, 'active': False,
-                              'patches': [], 'index': index})
-        references[:] = [ref for ref in references if len(ref['patches']) < 256][:4]
-
 def _local_views(candidates, config, fingerprints):
     """最多预读八张，顺序消费结果，避免同时持有整段视频的原尺寸图。"""
     from PIL import Image
@@ -1580,16 +1354,15 @@ def _local_views(candidates, config, fingerprints):
             payload = candidate.path.read_bytes()
             digest = hashlib.sha256(payload).digest()
         if digest in fingerprints:
-            return candidate, digest, None, None, None, None, None
+            return candidate, digest, None, None, None, None
         with Image.open(io.BytesIO(payload) if payload is not None else candidate.path) as image:
             source = np.asarray(image.convert('RGB'))
-        source, ignored = _analysis_pixels(source, config)
         height, width = source.shape[:2]
         scale = min(1.0, config.local_analysis_max_edge / max(height, width))
         small = cv.resize(source, (max(8, round(width * scale)), max(8, round(height * scale))),
                           interpolation=cv.INTER_AREA)
         boxes, background = _local_boxes(small)
-        return candidate, digest, source, small, boxes, background, ignored
+        return candidate, digest, source, small, boxes, background
     with ThreadPoolExecutor(max_workers=4, thread_name_prefix='frame-local-read') as workers:
         iterator, pending = iter(candidates), deque()
         for _ in range(8):
@@ -1609,15 +1382,13 @@ def _analyze_local_content(candidates, config):
     cv = _local_cv()
     analysis = _LocalAnalysis(list(candidates))
     tracks, backgrounds, fingerprints, background_keys = [], [], {}, {}
-    scroll_references, scroll_overrides, exact_copies = [], {}, {}
     background_descriptors = np.empty((len(candidates), 48), dtype=np.float32)
-    for index, (candidate, digest, source, small, boxes, background, ignored) in enumerate(_local_views(candidates, config, fingerprints)):
+    for index, (candidate, digest, source, small, boxes, background) in enumerate(_local_views(candidates, config, fingerprints)):
         identity = id(candidate)
         candidate.evidence_ids = ()
         analysis.coverage[identity] = set()
         if digest in fingerprints:
             previous = fingerprints[digest]
-            exact_copies[identity] = id(previous)
             analysis.details[identity] = {**analysis.details[id(previous)], 'exact_repeat_of': previous.time}
             analysis.quality[identity] = analysis.quality[id(previous)]
             analysis.descriptors[identity] = analysis.descriptors[id(previous)]
@@ -1714,9 +1485,8 @@ def _analyze_local_content(candidates, config):
         analysis.quality[identity] = (sum(exposures), -sum(clipped_edges),
                                       round(sum(sharpness) / max(1, len(sharpness)), 4), -sum(motion))
         analysis.descriptors[identity] = cv.resize(small, (12, 20), interpolation=cv.INTER_AREA).astype(np.float32) / 255
-        analysis.details[identity] = {'regions': regions, 'background_id': background_id, 'ignored_recording_timer': ignored,
+        analysis.details[identity] = {'regions': regions, 'background_id': background_id,
                                       'note': '局部区域和裁切线索，不代表已识别弹窗用途或确认完整性'}
-        _scroll_coverage(analysis, config, candidate, source, scroll_references, scroll_overrides, index)
         # 活跃跟踪最多保存 32 份参考图；更早的内容只留覆盖区间和记录。
         active = sorted((track for track in tracks if track.pixels is not None),
                         key=lambda t: (t.last_index, t.index))
@@ -1734,11 +1504,6 @@ def _analyze_local_content(candidates, config):
             for observation in track.observations:
                 if float(np.mean((rows >= observation['top']) & (rows < observation['bottom']))) >= .8:
                     analysis.coverage[id(observation['candidate'])].add(key)
-    analysis.coverage.update(scroll_overrides)
-    for identity, previous in exact_copies.items():
-        analysis.coverage[identity] = set(analysis.coverage[previous])
-        if 'scroll_comparison' in analysis.details[previous]:
-            analysis.details[identity]['scroll_comparison'] = analysis.details[previous]['scroll_comparison']
     anchors = {id(c) for c in _selection_anchors(candidates, 15)}
     def rank(candidate):
         coverage = analysis.coverage[id(candidate)]
@@ -1761,8 +1526,7 @@ def _analyze_local_content(candidates, config):
         details = {**analysis.details[identity], 'coverage_ids': list(candidate.evidence_ids)}
         if identity in analysis.replacements:
             representative = analysis.replacements[identity]
-            _note(candidate, '正文对齐后换用展示更充分的代表图' if 'scroll_comparison' in details
-                  else '同一内容换用展示更充分或更清楚的代表图', [representative], **details)
+            _note(candidate, '同一内容换用展示更充分或更清楚的代表图', [representative], **details)
         else:
             _note(candidate, '保留独立内容或互补范围的候选，尚未占用最终名额', **details)
     return analysis
@@ -1964,7 +1728,7 @@ def extract_scene_keyframes(
     *,
     task_start_time: float = DEFAULT_TASK_START_TIME,
     task_end_time: float | None = None,
-    sample_fps: float = 4.0,
+    sample_fps: float = 3.0,
     config: KeyframeConfig | None = None,
     algorithm_version: str = KEYFRAME_ALGORITHM_VERSION,
 ) -> list[Path]:
@@ -2086,7 +1850,7 @@ def video_to_frame_urls(
     *,
     task_start_time: float = DEFAULT_TASK_START_TIME,
     task_end_time: float | None = None,
-    sample_fps: float = 4.0,
+    sample_fps: float = 3.0,
     config: KeyframeConfig | None = None,
 ) -> list[str]:
     """抽帧并编码为裁判可直接使用的 image_url 列表。"""
