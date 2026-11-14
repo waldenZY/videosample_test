@@ -32,7 +32,7 @@ from pathlib import Path
 import numpy as np
 
 
-KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4.9"
+KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4.10"
 DEFAULT_TASK_START_TIME = 7.0
 DEFAULT_ANALYSIS_MASK_BOX = (.63, .005, .74, .040)
 
@@ -354,6 +354,7 @@ class KeyframeConfig:
     local_search_reuse: bool = True
     local_match_workers: int = 2
     local_bounded_search: bool = True
+    local_reference_prefilter: bool = True
     analysis_mask_box: tuple | None = DEFAULT_ANALYSIS_MASK_BOX
     scroll_dedup_enabled: bool = True
     scroll_analysis_max_edge: int = 800
@@ -397,7 +398,7 @@ class KeyframeConfig:
             raise ValueError("局部分析尺寸或内容分段过小")
         if not 0 < self.local_template_threshold <= 1:
             raise ValueError("局部匹配阈值必须在 0 到 1 之间")
-        for name in ('local_fast_alignment', 'local_search_reuse', 'local_bounded_search'):
+        for name in ('local_fast_alignment', 'local_search_reuse', 'local_bounded_search', 'local_reference_prefilter'):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} 必须为布尔值")
         if (isinstance(self.local_match_workers, bool) or not isinstance(self.local_match_workers, Integral)
@@ -1304,6 +1305,7 @@ class _LocalTrack:
     gray: np.ndarray | None = None
     reliable: bool = True
     search_data: object = None
+    row_summary: object = None
 
 
 @dataclass
@@ -1320,12 +1322,52 @@ class _LocalAnalysis:
     performance: dict = field(default_factory=dict)
 
 
+class _LocalRows:
+    """原 RGB 区域的八列面积均值与纵向积分，不保留原图。"""
+    def __init__(self, pixels):
+        cv = _local_cv()
+        means = cv.resize(pixels[:, 2:-2].astype(np.float32), (8, len(pixels)),
+                          interpolation=cv.INTER_AREA).astype(np.float64)
+        self.rows = np.concatenate([means, np.zeros((1, 8, 3))])
+        self.prefix = np.concatenate([np.zeros((1, 8, 3)), np.cumsum(means, axis=0)])
+        self.height = len(pixels)
+
+    def integral(self, positions):
+        whole = np.floor(positions).astype(np.intp)
+        return self.prefix[whole] + (positions - whole)[..., None, None] * self.rows[whole]
+
+    def possibly_matches(self, other, config):
+        minimum = max(8, math.ceil(min(self.height, other.height) * .40))
+        if minimum > min(self.height, other.height):
+            return True
+        positions = np.arange(-other.height + minimum, self.height - minimum + 1)
+        top = np.maximum(positions, 0)
+        length = np.minimum(self.height, positions + other.height) - top
+        other_top = top - positions
+        # 原核对先比较 8×8 的 RGB RMS，门槛为 global + 2/255。
+        # 这里合并部分行只会降低 RMS；再给两级像素余量覆盖面积均值与量化误差。
+        cutoff = (config.global_dedup_rms_threshold + 4 / 255 + 1e-9) * 255
+        for bins in (1, 2, 4, 8):
+            boundaries = np.linspace(0, 1, bins + 1)
+            left = self.integral(top[:, None] + length[:, None] * boundaries)
+            right = other.integral(other_top[:, None] + length[:, None] * boundaries)
+            delta = np.diff(left - right, axis=1) * (bins / length[:, None, None, None])
+            keep = np.mean(delta * delta, axis=(1, 2, 3)) <= cutoff * cutoff
+            if not np.any(keep):
+                return False
+            if bins == 1 and np.count_nonzero(keep) > 128:
+                return True  # 仍有很多可能位置时，及时交还原搜索，不继续花费预筛时间。
+            top, length, other_top = top[keep], length[keep], other_top[keep]
+        return True
+
+
 class _LocalSearchData:
     """一份不再改写的灰度图；纹理条及精确摘要按需计算。"""
     def __init__(self, gray):
         self.gray = gray
         self._templates = None
         self._digest = None
+        self._row_summary = None
         self._lock = threading.Lock()
 
     def templates(self, work):
@@ -1348,6 +1390,13 @@ class _LocalSearchData:
             if self._digest is None:
                 self._digest = (self.gray.shape, hashlib.sha256(self.gray.tobytes()).digest())
             return self._digest
+
+    def rows(self, pixels, work):
+        with self._lock:
+            if self._row_summary is None:
+                self._row_summary = _LocalRows(pixels)
+                work.add('reference_rows_prepared')
+            return self._row_summary
 
 
 class _LocalBoundedSearch:
@@ -1527,7 +1576,8 @@ class _LocalWork:
                           'pair_attempts', 'full_search_attempts', 'template_calls',
                           'original_position_hits', 'failed_pairs', 'width_mismatches', 'strict_checks',
                           'coarse_attempts', 'coarse_negative_results', 'coarse_fallbacks',
-                          'template_full_calls', 'coarse_refine_calls')},
+                          'template_full_calls', 'coarse_refine_calls', 'reference_filter_checks',
+                          'reference_filter_rejections', 'reference_width_skips')},
                       'position_search_work_s': round(self.frame_counts['position_search_work_s'], 4),
                       'strict_check_work_s': round(self.frame_counts['strict_check_work_s'], 4)}
             self.slowest_frames.append(record)
@@ -1578,6 +1628,10 @@ class _LocalWork:
         """原顺序裁决。最近参考先串行，其余小批并行，整批结束才允许改写参考图。"""
         def locate(track):
             return _locate_local_content(track, crop, self.config, crop_gray, self, crop_data)
+        if self.config.local_reference_prefilter:
+            eligible = [track for track in tracks if track.pixels.shape[1] == crop.shape[1]]
+            self.add('reference_width_skips', len(tracks) - len(eligible))
+            tracks = eligible
         if not tracks:
             return
         with self.measure('comparison_wall_s'):
@@ -1632,6 +1686,26 @@ def _locate_local_content(track, crop, config, crop_gray=None, work=None, crop_d
             # 不伪造未执行的模板搜索置信分数。
             work.add('original_position_hits')
             return _LocalLocation(track.origin, 0.0, 'original_position')
+    if (config.local_reference_prefilter and min(rh, ch) >= 8 and crop.shape[1] >= 12
+            and reference.dtype == np.uint8 and crop.dtype == np.uint8):
+        with work.measure('reference_filter_work_s'):
+            if crop_data is None:
+                if crop_gray is None:
+                    crop_gray = cv.cvtColor(crop, cv.COLOR_RGB2GRAY)
+                crop_data = _LocalSearchData(crop_gray)
+            if track.row_summary is None:
+                track.row_summary = _LocalRows(reference)
+                work.add('reference_rows_prepared')
+            crop_rows = crop_data.rows(crop, work)
+            work.add('reference_filter_checks')
+            possible = track.row_summary.possibly_matches(crop_rows, config)
+        if not possible:
+            work.add('reference_filter_rejections')
+            work.add('failed_pairs')
+            # scene 的灰度存在性还参与低对比可靠性判断，保持原来的准备副作用。
+            if track.kind == 'scene' and track.gray is None:
+                track.gray = cv.cvtColor(reference, cv.COLOR_RGB2GRAY)
+            return None
     work.add('full_search_attempts')
     with work.measure('position_search_work_s'):
         possible = {track.origin, track.origin + rh - ch}
@@ -1694,6 +1768,7 @@ def _extend_local_track(track, crop, position):
     track.origin, track.pixels = top, combined
     track.gray = None
     track.search_data = None
+    track.row_summary = None
     track.color = np.median(combined, axis=(0, 1))
     return True
 
@@ -1790,6 +1865,12 @@ def _analyze_local_content(candidates, config):
                            template_search_work_s=round(work.counts['template_search_s'], 4),
                            match_workers=config.local_match_workers,
                            coarse_search=coarse,
+                           reference_filter={
+                               'enabled': config.local_reference_prefilter,
+                               **{key: int(work.counts[key]) for key in (
+                                   'reference_filter_checks', 'reference_filter_rejections',
+                                   'reference_width_skips', 'reference_rows_prepared')},
+                               'work_s': round(work.counts['reference_filter_work_s'], 4)},
                            timing_schema='local-cost-v1',
                            timing_breakdown={
                                'comparison_wall_s': round(comparison, 4),
@@ -1867,6 +1948,7 @@ def _analyze_local_content_impl(candidates, config, work):
                 if matched is None:
                     track = _LocalTrack(len(tracks), crop.copy(), 0, ratio, kind, index)
                     track.color, track.gray = crop_color, crop_gray
+                    track.row_summary = crop_data._row_summary
                     if fallback and float(crop_gray.std()) < 2:
                         track.reliable = not any(old.gray is not None and float(old.gray.std()) < 2
                                                  and np.abs(old.color - crop_color).max() <= 8 for old in active)
@@ -1928,6 +2010,7 @@ def _analyze_local_content_impl(candidates, config, work):
                 old.pixels = None
                 old.gray = None
                 old.search_data = None
+                old.row_summary = None
     for track in tracks:
         bins = _local_track_bins(track, config)
         for number, rows in bins:

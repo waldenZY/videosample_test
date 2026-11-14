@@ -52,6 +52,10 @@ assert(element('localPerformance').innerHTML.includes('小图限制搜索范围'
 assert(element('localPerformance').innerHTML.includes('20.0%'));
 assert(element('localPerformance').innerHTML.includes('原图全范围搜索 20 次'));
 assert(element('localPerformance').innerHTML.includes('需搜索位置的比较'));
+vm.runInContext(`renderLocalPerformance({elapsed_s:3,input_frames:63,reference_filter:{enabled:true,reference_filter_checks:100,reference_filter_rejections:70,reference_width_skips:20,work_s:.2}})`,context);
+assert(element('localPerformance').innerHTML.includes('参考快速排除'));
+assert(element('localPerformance').innerHTML.includes('跳过重搜索 70 次'));
+assert(element('localPerformance').innerHTML.includes('帧仍可参选'));
 vm.runInContext(`renderLocalPerformance({elapsed_s:0,input_frames:0,coarse_search:{enabled:true,coarse_attempts:0,fallback_rate:null}})`,context);
 assert(!element('localPerformance').innerHTML.includes('NaN'));
 vm.runInContext('renderTimings({})',context);

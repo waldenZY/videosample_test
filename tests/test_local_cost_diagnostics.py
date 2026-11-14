@@ -16,7 +16,7 @@ def test_comparison_timer_excludes_parent_work_between_results(monkeypatch):
         return None
 
     monkeypatch.setattr(media, '_locate_local_content', locate)
-    work = media._LocalWork(media.KeyframeConfig(local_match_workers=1))
+    work = media._LocalWork(media.KeyframeConfig(local_match_workers=1, local_reference_prefilter=False))
     results = work.comparisons([object(), object()], None, None, None)
     next(results)
     clock[0] += 50  # 主线程在两个结果之间处理其他事情，不能算作比较时间。
