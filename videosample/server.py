@@ -143,7 +143,7 @@ def import_table(file: UploadFile = File(...)):
            "filename": filename, "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
            "version": algorithms.snapshot("current")["algorithm_version"],
            "algorithm": algorithms.snapshot("current", max_frames=15), "run_mode": "current",
-           "experiment_max_frames": 15, "status": "imported",
+           "experiment_max_frames": 15, "experiment_selection_scoring": "content_weight", "status": "imported",
            "warnings": warnings, "errors": errors, "sheet": sheet, "summary": summary,
            "rows": [{"index": index, "item": item, "status": "ready", "message": "等待开始"}
                     for index, item in enumerate(items)]}
@@ -241,6 +241,9 @@ def chain_summaries(run):
         result.append({"key": key, "id": identity, "name": "base · 固定链路" if key == "base" else "实验链路",
                        "status": chain["status"], "count": len(chain["rows"]),
                        "version": chain.get("version"), "statistics": chain_statistics(chain),
+                       "selection_scoring": (chain.get('algorithm', {}).get('overrides', {}).get('selection_scoring',
+                           chain.get('algorithm', {}).get('defaults', {}).get('selection_scoring', 'content_weight'))
+                           if key == 'current' else None),
                        "frame_limit": (chain.get("algorithm", {}).get("overrides", {}).get("max_frames")
                                        if key == "current" else None),
                        "done": sum(row["status"] == "done" for row in chain["rows"]),
@@ -253,6 +256,7 @@ class StartRequest(BaseModel):
     name: str = ""
     run_mode: Literal["base", "current", "both"] = "both"
     experiment_max_frames: Literal[5, 10, 15] = 15
+    experiment_selection_scoring: Literal['content_weight', 'new_content_ratio'] | None = None
 
 
 @app.post("/api/runs/{identity}/start")
@@ -264,6 +268,7 @@ def start(identity: str, request: StartRequest):
         indices = sorted(set(request.indices if request.indices is not None else range(len(run["rows"]))))
         if not indices or any(index < 0 or index >= len(run["rows"]) for index in indices):
             raise HTTPException(422, "请勾选有效样本")
+        scoring = request.experiment_selection_scoring or run.get('experiment_selection_scoring', 'content_weight')
         selected = set(indices)
         for row in run["rows"]:
             row.update(status="queued" if row["index"] in selected else "skipped",
@@ -273,11 +278,13 @@ def start(identity: str, request: StartRequest):
         keys = {"base": ["base"], "current": ["current"], "both": ["base", "current"]}[request.run_mode]
         chain_ids = {key: identity if index == 0 else uuid.uuid4().hex for index, key in enumerate(keys)}
         run.update(group_id=identity, chain_ids=chain_ids, run_mode=request.run_mode,
-                   experiment_max_frames=request.experiment_max_frames)
+                   experiment_max_frames=request.experiment_max_frames,
+                   experiment_selection_scoring=scoring)
         for key, chain_id in chain_ids.items():
             chain = deepcopy(run)
             chain["id"] = chain_id
-            chain["algorithm"] = algorithms.snapshot(key, max_frames=request.experiment_max_frames)
+            chain["algorithm"] = algorithms.snapshot(key, max_frames=request.experiment_max_frames,
+                                                       selection_scoring=scoring)
             chain["version"] = chain["algorithm"]["algorithm_version"]
             save_run(chain)
             algorithms.save_source(key, run_directory(chain_id))
@@ -300,8 +307,11 @@ def copy_run(identity: str):
                    for row in run["rows"]]
     run["run_mode"] = run.get("run_mode", "current")
     run["experiment_max_frames"] = 15
+    run['experiment_selection_scoring'] = run.get('experiment_selection_scoring',
+        run.get('algorithm', {}).get('overrides', {}).get('selection_scoring', 'content_weight'))
     run["algorithm"] = algorithms.snapshot("current" if run["run_mode"] == "current" else "base",
-                                           max_frames=run["experiment_max_frames"])
+                                           max_frames=run["experiment_max_frames"],
+                                           selection_scoring=run['experiment_selection_scoring'])
     run["version"] = run["algorithm"]["algorithm_version"]
     with LOCK:
         save_run(run)
@@ -349,6 +359,8 @@ def process_row(identity: str, index: int):
                 overrides = run["algorithm"].get("overrides", {})
                 if "max_frames" in overrides:
                     kwargs["max_frames"] = overrides["max_frames"]
+                if 'selection_scoring' in overrides:
+                    kwargs['selection_scoring'] = overrides['selection_scoring']
         with measure_phase(timings, "fingerprint"):
             with video.open("rb") as handle:
                 digest = hashlib.sha256()

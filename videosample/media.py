@@ -24,7 +24,7 @@ from collections import Counter, OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from functools import lru_cache, wraps
 from numbers import Integral, Real
 from pathlib import Path
@@ -32,7 +32,7 @@ from pathlib import Path
 import numpy as np
 
 
-KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4.10"
+KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4.11"
 DEFAULT_TASK_START_TIME = 7.0
 DEFAULT_ANALYSIS_MASK_BOX = (.63, .005, .74, .040)
 
@@ -355,6 +355,7 @@ class KeyframeConfig:
     local_match_workers: int = 2
     local_bounded_search: bool = True
     local_reference_prefilter: bool = True
+    selection_scoring: str = 'content_weight'
     analysis_mask_box: tuple | None = DEFAULT_ANALYSIS_MASK_BOX
     scroll_dedup_enabled: bool = True
     scroll_analysis_max_edge: int = 800
@@ -398,6 +399,8 @@ class KeyframeConfig:
             raise ValueError("局部分析尺寸或内容分段过小")
         if not 0 < self.local_template_threshold <= 1:
             raise ValueError("局部匹配阈值必须在 0 到 1 之间")
+        if not isinstance(self.selection_scoring, str) or self.selection_scoring not in {'content_weight', 'new_content_ratio'}:
+            raise ValueError("selection_scoring 必须为 content_weight 或 new_content_ratio")
         for name in ('local_fast_alignment', 'local_search_reuse', 'local_bounded_search', 'local_reference_prefilter'):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} 必须为布尔值")
@@ -2050,66 +2053,9 @@ def _analyze_local_content_impl(candidates, config, work):
 
 
 def _limit_candidates_without_scroll(candidates, limit, *, config=None, analysis=None):
-    """按尚未覆盖的内容选图，内容覆盖完即停；上限不是目标张数。"""
-    config = config or KeyframeConfig()
-    limit = min(15, limit)
-    analysis = analysis or _analyze_local_content(candidates, config)
-    selected = _selection_anchors(list(candidates), limit)
-    selected_ids = {id(c) for c in selected}
-    covered = set().union(*(analysis.coverage[id(c)] for c in selected)) if selected else set()
-    eligible = set().union(*(analysis.coverage[id(c)] for c in analysis.representatives))
-    required = {key for key in eligible if analysis.units[key]['weight'] > 0}
-    rounds = {}
-    while len(selected) < limit:
-        remaining = [c for c in analysis.representatives if id(c) not in selected_ids]
-        def gain(candidate):
-            return sum(analysis.units[key]['weight'] for key in analysis.coverage[id(candidate)] - covered)
-        useful = [c for c in remaining if gain(c) > 1e-9]
-        if not useful:
-            break
-        def rank(candidate):
-            descriptor = analysis.descriptors[id(candidate)]
-            novelty = min((float(np.mean((descriptor - analysis.descriptors[id(c)]) ** 2))
-                           for c in selected), default=1.0)
-            return (gain(candidate), *analysis.quality[id(candidate)], novelty,
-                    candidate.support_s, candidate.time)
-        best = max(useful, key=rank)
-        rounds[id(best)] = {'round': len(selected) + 1, 'new_content_weight': round(gain(best), 6)}
-        selected.append(best)
-        selected_ids.add(id(best))
-        covered.update(analysis.coverage[id(best)])
-    uncovered = required - covered
-    uncertain = {key for key in eligible if analysis.units[key]['weight'] == 0} - covered
-    hit = bool(uncovered) and len(selected) >= limit
-    reason = 'limit_reached' if hit else ('covered' if not uncovered and not uncertain else 'no_reliable_addition')
-    analysis.summary = {'policy': 'adaptive-local-v1', 'limit': limit, 'stop_reason': reason, 'hit_limit': hit,
-                        'input_count': len(analysis.candidates), 'representative_count': len(analysis.representatives),
-                        'identified_content_count': len(required), 'covered_content_count': len(required & covered),
-                        'uncovered_count': len(uncovered),
-                        'uncertain_content_count': len(uncertain),
-                        'uncovered_content': [analysis.units[key] for key in sorted(uncovered)],
-                        'selected_count': len(selected)}
-    for candidate in candidates:
-        identity = id(candidate)
-        missing = analysis.coverage[identity] - covered
-        common = [c for c in selected if c is not candidate
-                  and analysis.coverage[identity] & analysis.coverage[id(c)]]
-        details = {'frame_limit': limit, 'coverage_ids': list(candidate.evidence_ids),
-                   'uncovered_ids': sorted(missing), 'stop_reason': reason}
-        if identity in selected_ids:
-            _note(candidate, '保留任务首帧或结束位置' if identity not in rounds
-                  else '覆盖尚未展示的局部内容或整体状态', **details, **rounds.get(identity, {}))
-        elif identity in analysis.replacements:
-            _note(candidate, '同一内容已换用展示更充分的代表图', [analysis.replacements[identity]], **details)
-        elif not missing:
-            _note(candidate, '此帧识别到的内容已由所选图片覆盖，不补图凑数', common, **details)
-        elif hit:
-            _note(candidate, f'达到 {limit} 张上限，此帧仍有内容未覆盖', selected[-1:],
-                  last_selected_comparison=rounds.get(id(selected[-1]), {}),
-                  new_content_weight=round(sum(analysis.units[key]['weight'] for key in missing), 6), **details)
-        else:
-            _note(candidate, '未发现可靠新增内容，停止增加图片', common, **details)
-    return sorted(selected, key=lambda c: c.time)
+    """关闭滑动检查时仍共用同一计分和竞争记录。"""
+    config = replace(config or KeyframeConfig(), scroll_dedup_enabled=False)
+    return _limit_candidates(candidates, limit, config=config, analysis=analysis)
 
 
 @dataclass(frozen=True)
@@ -2451,7 +2397,56 @@ def _scroll_judge(a, b):
 def _scroll_early_failure(match_count, moving, area):
     return {'decision': 'keep' if match_count >= 8 else 'uncertain', 'reason': '对齐后仍有前景变化' if match_count >= 8 else '缺少可靠的共同图案', 'motion_models': moving, 'feature_matches': match_count, 'certified_residual_lower_bound': int(area), 'terminated_early': True}
 
-def _choose_with_scroll(candidates, analysis, anchors, frame_ids, compare=None, *, limit=15, max_related=3, max_checks=None, routing='mixed'):
+class _SelectionScorer:
+    """只复用已有内容记录计分；不读图、不做替换复审。"""
+    def __init__(self, analysis, coverage, method):
+        self.analysis, self.coverage, self.method = analysis, coverage, method
+        self.weights = {key: unit['weight'] for key, unit in analysis.units.items()}
+        self.foreground = {key for key, unit in analysis.units.items()
+                           if unit.get('kind') != 'background' and unit['weight'] > 0}
+        self.denominators = {}
+
+    def total(self, keys):
+        return round(math.fsum(self.weights[key] for key in sorted(keys)), 12)
+
+    def metrics(self, candidate, covered):
+        identity = id(candidate)
+        visible = self.coverage[identity]
+        foreground = visible & self.foreground
+        cached = self.denominators.get(identity)
+        if cached is None or cached[0] != foreground:
+            groups = {(self.analysis.units[key].get('kind'), self.analysis.units[key].get('track', key.split(':')[0]))
+                      for key in foreground}
+            cached = (foreground, self.total(foreground), len(groups))
+            self.denominators[identity] = cached
+        denominator = cached[1]
+        raw_gain = self.total(visible - covered)
+        foreground_gain = self.total(foreground - covered)
+        ratio = round(foreground_gain / denominator, 12) if denominator > 1e-9 else 0.
+        return {'method': self.method,
+                'score': raw_gain if self.method == 'content_weight' else ratio,
+                'new_content_weight': raw_gain, 'new_foreground_weight': foreground_gain,
+                'visible_foreground_weight': denominator, 'new_content_ratio': ratio,
+                'new_background_weight': round(max(0., raw_gain - foreground_gain), 12),
+                'foreground_group_count': cached[2]}
+
+    def rank(self, candidate, metrics, novelty, order):
+        return (metrics['score'], *self.analysis.quality[id(candidate)], novelty,
+                candidate.support_s, candidate.time, order[id(candidate)])
+
+    def deciding_factor(self, candidate_rank, winner_rank, quality_length):
+        quality = ['区域展示范围', '边缘裁切', '清晰度', '区域偏移'] if quality_length == 4 else [
+            f'代表图质量第 {i + 1} 项' for i in range(quality_length)]
+        labels = ['新增内容权重' if self.method == 'content_weight' else '新增内容比例',
+                  *quality, '与已选画面的差异', '停留情况', '画面时间', '稳定顺序']
+        for index, (left, right) in enumerate(zip(candidate_rank, winner_rank)):
+            if left != right:
+                return {'label': labels[index], 'candidate_value': left, 'winner_value': right}
+        return {'label': '本轮优先图', 'candidate_value': None, 'winner_value': None}
+
+
+def _choose_with_scroll(candidates, analysis, anchors, frame_ids, compare=None, *, limit=15, max_related=3,
+                        max_checks=None, routing='mixed', scoring='content_weight', record_competitions=False):
     limit = min(15, limit)
     order = {id(c): i for (i, c) in enumerate(candidates)}
     lookup = {id(c): c for c in candidates}
@@ -2460,6 +2455,8 @@ def _choose_with_scroll(candidates, analysis, anchors, frame_ids, compare=None, 
     groups = {id(c): [id(c)] for c in selected}
     coverage = {key: set(value) for (key, value) in analysis.coverage.items()}
     weights = {key: unit['weight'] for (key, unit) in analysis.units.items()}
+    scorer = _SelectionScorer(analysis, coverage, scoring)
+    last_competitions = {}
     blocked = set()
     events = []
     checks = 0
@@ -2489,18 +2486,28 @@ def _choose_with_scroll(candidates, analysis, anchors, frame_ids, compare=None, 
         present = {id(c) for c in selected}
         seen = covered()
         remaining = [c for c in analysis.representatives if id(c) not in present | blocked]
-        useful = [c for c in remaining if total(coverage[id(c)] - seen) > 1e-09]
+        metrics = {id(c): scorer.metrics(c, seen) for c in remaining}
+        useful = [c for c in remaining if metrics[id(c)]['new_content_weight'] > 1e-09]
         if not useful:
             break
 
         def rank(candidate):
             ident = id(candidate)
             novelty = min((float(np.mean((analysis.descriptors[ident] - analysis.descriptors[id(c)]) ** 2)) for c in selected), default=1.0)
-            return (total(coverage[ident] - seen), *analysis.quality[ident], novelty, candidate.support_s, candidate.time, order[ident])
-        candidate = max(useful, key=rank)
+            return scorer.rank(candidate, metrics[ident], novelty, order)
+        ranks = {id(c): rank(c) for c in useful}
+        candidate = max(useful, key=lambda c: ranks[id(c)])
         cid = id(candidate)
         visited += 1
-        event = {'candidate': frame_ids[cid], 'gain_before_check': total(coverage[cid] - seen), 'checks': []}
+        event = {'candidate': frame_ids[cid], 'gain_before_check': metrics[cid]['new_content_weight'],
+                 'score_before_check': metrics[cid], 'checks': []}
+        if record_competitions:
+            round_winner = {'frame_id': frame_ids[cid], 'time': candidate.time, 'score': metrics[cid]}
+            for other in useful:
+                last_competitions[frame_ids[id(other)]] = {
+                    'schema': 'selection-competition-v1', 'round': visited, 'selection_slot': len(selected) + 1,
+                    'winner': round_winner, 'candidate_score': metrics[id(other)],
+                    'deciding_factor': scorer.deciding_factor(ranks[id(other)], ranks[cid], len(analysis.quality[id(other)]))}
         matched = False
         if compare is not None and checks < max_checks:
             possible = []
@@ -2564,19 +2571,20 @@ def _choose_with_scroll(candidates, analysis, anchors, frame_ids, compare=None, 
             if compare is not None and checks >= max_checks:
                 event.setdefault('notes', []).append('检查预算用完，按原选图规则保留，未确认重复不删除')
         events.append(event)
+        if record_competitions:
+            round_winner['action'] = event['action']
     selected.sort(key=lambda c: (c.time, order[id(c)]))
     all_eligible = set().union(*(analysis.coverage[id(c)] for c in analysis.representatives))
     missing = {k for k in all_eligible - covered() if weights[k] > 0}
     reason = 'limit_reached' if len(selected) >= limit and missing else 'recorded_units_covered' if not missing else 'no_reliable_addition'
     result = {'selected_ids': [frame_ids[id(c)] for c in selected], 'selected_count': len(selected), 'visited_candidates': visited, 'checks': checks, 'replacement_checks': replacement_checks, 'check_budget': max_checks, 'budget_exhausted': checks >= max_checks, 'stop_reason': reason, 'uncovered_units': len(missing), 'events': events, 'groups': [{'representative': frame_ids[id(c)], 'members': [frame_ids[m] for m in groups[id(c)]]} for c in selected]}
+    result['last_competitions'] = last_competitions
     assert len(selected) <= limit and len(events) <= len(candidates)
     return result
 
 def _limit_candidates(candidates, limit, *, config=None, analysis=None):
     """Allocate a slot only after the previous, lightweight scroll check."""
     config = config or KeyframeConfig()
-    if not config.scroll_dedup_enabled:
-        return _limit_candidates_without_scroll(candidates, limit, config=config, analysis=analysis)
     analysis = analysis or _analyze_local_content(candidates, config)
     pool = list(analysis.candidates)
     recorder = _PROCESS.get()
@@ -2588,16 +2596,18 @@ def _limit_candidates(candidates, limit, *, config=None, analysis=None):
                                min_width=config.scroll_min_width, min_height=config.scroll_min_height,
                                analysis_mask_box=config.analysis_mask_box,
                                agent_indicator_box=config.scroll_agent_indicator_box)
-    engine = _ScrollEngine(frames, Path(), view_capacity=16, raw_capacity=48, config=settings)
+    engine = _ScrollEngine(frames, Path(), view_capacity=16, raw_capacity=48, config=settings) if config.scroll_dedup_enabled else None
     try:
         result = _choose_with_scroll(pool, analysis, _selection_anchors(list(candidates), limit),
-                                     frame_ids, engine.compare, limit=limit,
+                                     frame_ids, engine.compare if engine is not None else None, limit=limit,
                                      max_related=config.scroll_max_related,
-                                     max_checks=config.scroll_checks_per_candidate * len(pool))
-        comparisons = list(engine.logs)
-        counters = dict(engine.counts)
+                                     max_checks=config.scroll_checks_per_candidate * len(pool),
+                                     scoring=config.selection_scoring, record_competitions=recorder is not None)
+        comparisons = list(engine.logs) if engine is not None else []
+        counters = dict(engine.counts) if engine is not None else {}
     finally:
-        engine.close()
+        if engine is not None:
+            engine.close()
     selected = [lookup[fid] for fid in result['selected_ids']]
     eligible = set().union(*(analysis.coverage[id(c)] for c in analysis.representatives))
     required = {key for key in eligible if analysis.units[key]['weight'] > 0}
@@ -2618,12 +2628,13 @@ def _limit_candidates(candidates, limit, *, config=None, analysis=None):
     merged_count = sum(len(group['members']) - 1 for group in result['groups'])
     checked = {r[key] for r in comparisons for key in ('a', 'b')}
     analysis.summary = {
-        'policy': 'adaptive-scroll-v1', 'limit': min(limit, 15), 'stop_reason': reason, 'hit_limit': hit,
+        'policy': 'adaptive-scroll-v1' if config.scroll_dedup_enabled else 'adaptive-local-v1',
+        'scoring': config.selection_scoring, 'limit': min(limit, 15), 'stop_reason': reason, 'hit_limit': hit,
         'input_count': len(pool), 'representative_count': len(analysis.representatives),
         'identified_content_count': len(required), 'covered_content_count': len(required & covered),
         'uncovered_count': len(uncovered), 'uncertain_content_count': len(uncertain),
         'uncovered_content': [analysis.units[key] for key in sorted(uncovered)], 'selected_count': len(selected),
-        'scroll_dedup': {'enabled': True, 'checked_frames': len(checked),
+        'scroll_dedup': {'enabled': config.scroll_dedup_enabled, 'checked_frames': len(checked),
                          'comparisons': counters.get('judge', 0), 'merged_frames': merged_count,
                          'representative_changes': sum(e['action'] == 'replace' for e in result['events']),
                          'check_budget': result['check_budget'], 'budget_exhausted': result['budget_exhausted'],
@@ -2636,6 +2647,7 @@ def _limit_candidates(candidates, limit, *, config=None, analysis=None):
         per_frame[comparison['b']].append(comparison)
     selected_ids = {id(c) for c in selected}
     anchor_ids = {id(c) for c in _selection_anchors(list(candidates), limit)}
+    final_scorer = _SelectionScorer(analysis, analysis.coverage, config.selection_scoring)
     for candidate in candidates:
         fid, identity = frame_ids[id(candidate)], id(candidate)
         candidate.evidence_ids = tuple(sorted(analysis.coverage[identity]))
@@ -2643,12 +2655,18 @@ def _limit_candidates(candidates, limit, *, config=None, analysis=None):
         event = events.get(fid)
         details = {'frame_limit': min(limit, 15), 'coverage_ids': list(candidate.evidence_ids),
                    'uncovered_ids': sorted(missing), 'stop_reason': reason,
+                   'scoring': config.selection_scoring,
+                   'final_remaining_score': final_scorer.metrics(candidate, covered),
                    'scroll_checked': fid in checked, 'scroll_comparisons': per_frame[fid]}
+        competition = result['last_competitions'].get(fid)
+        if competition is not None:
+            details['selection_comparison'] = competition
         if event:
             details['selection_attempt'] = event
         representative = representatives.get(fid)
         if identity in selected_ids:
-            label = '保留任务首帧或结束位置' if identity in anchor_ids else '覆盖尚未展示的内容；入选前未确认滑动重复'
+            label = '保留任务首帧或结束位置' if identity in anchor_ids else (
+                '覆盖尚未展示的内容；入选前未确认滑动重复' if config.scroll_dedup_enabled else '覆盖尚未展示的内容')
             if event and event['action'] == 'replace':
                 label = '入选前确认重复，改用本帧作为代表并继续选图'
             _note(candidate, label, **details)
@@ -2661,9 +2679,11 @@ def _limit_candidates(candidates, limit, *, config=None, analysis=None):
         elif not missing:
             _note(candidate, '识别到的内容已被覆盖，不补图凑数', **details)
         elif hit:
-            _note(candidate, f'达到 {min(limit, 15)} 张上限，此帧仍有内容未覆盖', selected[-1:],
-                  last_selected_comparison={'new_content_weight': result['events'][-1]['gain_before_check']}
-                  if result['events'] else {},
+            rival = lookup[competition['winner']['frame_id']] if competition is not None else None
+            if competition is None:
+                details['comparison_status'] = 'anchors_filled_limit' if len(anchor_ids) >= limit else 'not_ranked'
+            _note(candidate, f'达到 {min(limit, 15)} 张上限，此帧仍有内容未覆盖',
+                  [rival] if rival is not None and rival is not candidate else [],
                   new_content_weight=round(math.fsum(analysis.units[key]['weight'] for key in sorted(missing)), 6),
                   **details)
         else:
@@ -2805,6 +2825,7 @@ def extract_scene_keyframes(
     task_start_time: float = DEFAULT_TASK_START_TIME,
     task_end_time: float | None = None,
     sample_fps: float = 3.0,
+    selection_scoring: str | None = None,
     config: KeyframeConfig | None = None,
     algorithm_version: str = KEYFRAME_ALGORITHM_VERSION,
 ) -> list[Path]:
@@ -2826,12 +2847,14 @@ def extract_scene_keyframes(
             scene_threshold=threshold,
             scene_min_gap_s=min_gap_s,
             max_edge=max_edge,
+            selection_scoring=selection_scoring if selection_scoring is not None else 'content_weight',
         )
     elif (
         task_start_time != DEFAULT_TASK_START_TIME
         or task_end_time is not None
+        or selection_scoring is not None
     ):
-        raise ValueError("传入 config 时不能再单独传任务起止时间")
+        raise ValueError("传入 config 时不能再单独传任务起止时间或计分方式")
     duration = probe_duration(video)
     if duration <= 0:
         return []

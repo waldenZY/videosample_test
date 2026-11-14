@@ -72,6 +72,22 @@ def test_plain_extraction_has_no_process_outputs(tmp_path, video):
     assert not (out / "candidates").exists()
 
 
+def test_server_executes_selected_ratio_method_and_saves_effective_config(tmp_path,video,monkeypatch):
+    monkeypatch.setattr(server,'RUNS',tmp_path/'runs')
+    monkeypatch.setattr(server.POOL,'submit',lambda *args:None)
+    payload=json.dumps({'id':'ratio','query':'测试比例计分','video_path':str(video),
+                        'task_start_time':7,'task_end_time':13}).encode()
+    with TestClient(server.app) as client:
+        imported=client.post('/api/import',files={'file':('ratio.jsonl',payload)}).json()
+        started=client.post(f"/api/runs/{imported['id']}/start",json={
+            'run_mode':'current','experiment_selection_scoring':'new_content_ratio'}).json()
+        server.process_row(started['id'],0)
+        result=server.read_run(started['id'])['rows'][0]
+        assert result['status']=='done',result.get('error')
+        assert result['effective_config']['selection_scoring']=='new_content_ratio'
+        assert result['selection']['scoring']=='new_content_ratio'
+
+
 def test_adaptive_selection_is_output_without_another_filter(tmp_path, video):
     with media.record_process(tmp_path / 'process') as recorder:
         frames = media.extract_scene_keyframes(video, tmp_path / 'final', task_end_time=13)

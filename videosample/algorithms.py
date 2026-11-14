@@ -21,7 +21,7 @@ def implementation(key):
     return _MODULES[key]
 
 
-def snapshot(key, *, max_frames=None):
+def snapshot(key, *, max_frames=None, selection_scoring=None):
     module = implementation(key)
     result = {"key": key, "name": "base · 原始方法" if key == "base" else "当前实验版",
             "algorithm_version": module.KEYFRAME_ALGORITHM_VERSION,
@@ -29,6 +29,11 @@ def snapshot(key, *, max_frames=None):
             "defaults": asdict(module.KeyframeConfig())}
     if key == "current" and max_frames is not None:
         result["overrides"] = {"max_frames": max_frames}
+    if key == 'current' and selection_scoring is not None:
+        if selection_scoring not in {'content_weight', 'new_content_ratio'}:
+            raise ValueError('未知计分方式')
+        if selection_scoring != result['defaults'].get('selection_scoring', 'content_weight'):
+            result.setdefault('overrides', {})['selection_scoring'] = selection_scoring
     if key == "current":
         result['selection_policy'] = 'adaptive-scroll-v1'
     return result

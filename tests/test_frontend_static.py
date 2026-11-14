@@ -68,7 +68,15 @@ assert.equal(context.renderLocalCostAverage({}), '');
 const averages=context.renderLocalCostAverage({timing_breakdown:{comparison_wall_s:{samples:2,mean:3},position_search_work_s:{samples:1,mean:4}}});
 assert(averages.includes('平均局部开销'));assert(averages.includes('3.00 秒（n=2）'));
 assert(averages.includes('4.00 秒（n=1）'));assert(averages.includes('不与实际耗时相加'));
+const competition=context.renderScoreComparison({selection_comparison:{round:3,selection_slot:15,candidate_score:{method:'new_content_ratio',score:.5,new_content_ratio:.5,new_content_weight:1,foreground_group_count:1},winner:{frame_id:'f00009',time:9,action:'select',score:{score:1,new_content_ratio:1,new_content_weight:3,foreground_group_count:3}},deciding_factor:{label:'新增内容比例',candidate_value:.5,winner_value:1}}});
+assert(competition.includes('选择第 15 张之前'));assert(competition.includes('新增比例（试验）'));
+assert(competition.includes('50.0%'));assert(competition.includes('100.0%'));
+assert(competition.includes('data-peer="f00009"'));assert(competition.includes('新增内容比例'));
+assert(context.renderScoreComparison({comparison_status:'anchors_filled_limit'}).includes('首尾位置已占满'));
+assert(context.renderScoreComparison({last_selected_comparison:{round:15}}).includes('旧版只保存'));
+assert.equal(context.renderScoreComparison({}), '');
 const html=fs.readFileSync('static/index.html','utf8');
 assert(html.includes('自适应，最多 15 张'));assert(html.includes('数量分布 / 停止情况'));
+assert(html.includes('新增权重（现有）'));assert(html.includes('新增比例（试验）'));
 '''
     subprocess.run([node, '-e', script], cwd=root, check=True, capture_output=True, text=True, timeout=15)

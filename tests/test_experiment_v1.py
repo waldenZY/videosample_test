@@ -99,7 +99,7 @@ def test_fast_evidence_at_two_three_and_four_fps(tmp_path, name, filters, expect
         assert not any(np.mean(image < 230) > 0.5 for image in old)
     metadata = json.loads((tmp_path / "experiment/keyframes.json").read_text(encoding="utf-8"))
     assert metadata["config"]["sample_fps"] == sample_fps
-    assert metadata["algorithm_version"] == "hybrid-state-exp-v4.10"
+    assert metadata["algorithm_version"] == "hybrid-state-exp-v4.11"
     assert metadata["selected"][0]["time"] == 7.0
     assert "task-end-explicit" in [row["keep_reason"] for row in metadata["selected"]]
     assert all(row["time"] <= 38 for row in metadata["selected"])
