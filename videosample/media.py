@@ -32,7 +32,7 @@ from pathlib import Path
 import numpy as np
 
 
-KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4.7"
+KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4.8"
 DEFAULT_TASK_START_TIME = 7.0
 DEFAULT_ANALYSIS_MASK_BOX = (.63, .005, .74, .040)
 
@@ -1357,10 +1357,70 @@ class _LocalWork:
         self.peaks = OrderedDict()
         self.lock = threading.Lock()
         self.pool = None
+        self.frame_counts = None
+        self.frame_info = None
+        self.slowest_frames = []
 
     def add(self, key, value=1):
         with self.lock:
             self.counts[key] += value
+            if self.frame_counts is not None:
+                self.frame_counts[key] += value
+
+    @contextmanager
+    def measure(self, key):
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.add(key, time.perf_counter() - started)
+
+    def equal(self, left, right, reference=None, crop=None):
+        # 包含原来的纹理检查，执行顺序与短路条件不变。
+        with self.measure('strict_check_work_s'):
+            self.add('strict_checks')
+            if not _strict_region_equal(left, right, self.config):
+                return False
+            return not (reference is not None and left.std() < 2
+                        and (reference.std() >= 3 or crop.std() >= 3))
+
+    def background_equal(self, left, right):
+        with self.measure('background_strict_wall_s'):
+            return self.equal(left, right)
+
+    @contextmanager
+    def frame(self, candidate, index, source):
+        recorder = _PROCESS.get()
+        self.frame_counts = Counter()
+        self.frame_info = {'frame_id': recorder.identities.get(id(candidate)) if recorder else None,
+                           'candidate_index': index, 'time': round(candidate.time, 3),
+                           'source_size': [int(source.shape[1]), int(source.shape[0])] if source is not None else None,
+                           'regions': [], 'largest_reference_size': None}
+        started = time.perf_counter()
+        completed = False
+        try:
+            yield
+            completed = True
+        finally:
+            elapsed = time.perf_counter() - started
+            record = {**self.frame_info, 'elapsed_s': round(elapsed, 4), 'completed': completed,
+                      **{key: int(self.frame_counts[key]) for key in (
+                          'pair_attempts', 'full_search_attempts', 'template_calls',
+                          'original_position_hits', 'failed_pairs', 'width_mismatches', 'strict_checks')},
+                      'position_search_work_s': round(self.frame_counts['position_search_work_s'], 4),
+                      'strict_check_work_s': round(self.frame_counts['strict_check_work_s'], 4)}
+            self.slowest_frames.append(record)
+            self.slowest_frames.sort(key=lambda item: (-item['elapsed_s'], item['candidate_index']))
+            del self.slowest_frames[3:]
+            self.frame_counts = self.frame_info = None
+
+    def reference_size(self, reference):
+        with self.lock:
+            if self.frame_info is not None:
+                size = [int(reference.shape[1]), int(reference.shape[0])]
+                previous = self.frame_info['largest_reference_size']
+                if previous is None or size[0] * size[1] > previous[0] * previous[1]:
+                    self.frame_info['largest_reference_size'] = size
 
     def peak(self, source, target, y, patch):
         cv = _local_cv()
@@ -1391,17 +1451,20 @@ class _LocalWork:
             return _locate_local_content(track, crop, self.config, crop_gray, self, crop_data)
         if not tracks:
             return
-        yield tracks[0], locate(tracks[0])
+        with self.measure('comparison_wall_s'):
+            result = locate(tracks[0])
+        yield tracks[0], result
         workers = self.config.local_match_workers
         for start in range(1, len(tracks), workers):
             wave = tracks[start:start + workers]
-            if workers == 1:
-                results = [locate(wave[0])]
-            else:
-                if self.pool is None:
-                    self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix='local-match')
-                # 等待整批任务结束；若一个失败，也在 wrapper 的 finally 中等待并清理。
-                results = list(self.pool.map(locate, wave))
+            with self.measure('comparison_wall_s'):
+                if workers == 1:
+                    results = [locate(wave[0])]
+                else:
+                    if self.pool is None:
+                        self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix='local-match')
+                    # 等待整批任务结束；若一个失败，也在 wrapper 的 finally 中等待并清理。
+                    results = list(self.pool.map(locate, wave))
             yield from zip(wave, results)
 
     def close(self):
@@ -1423,47 +1486,49 @@ def _locate_local_content(track, crop, config, crop_gray=None, work=None, crop_d
     work = work if work is not None else _LocalWork(config)
     work.add('pair_attempts')
     reference = track.pixels
+    work.reference_size(reference)
     if reference.shape[1] != crop.shape[1]:
+        work.add('width_mismatches')
         work.add('failed_pairs')
         return None
     rh, ch = len(reference), len(crop)
     if config.local_fast_alignment and rh == ch and rh >= 8:
         work.add('original_position_checks')
         left, right = reference[:, 2:-2], crop[:, 2:-2]
-        if (_strict_region_equal(left, right, config)
-                and not (left.std() < 2 and (reference.std() >= 3 or crop.std() >= 3))):
+        if work.equal(left, right, reference, crop):
             # 等高时，原位通过完整严格检查就是唯一最大重叠范围。
             # 不伪造未执行的模板搜索置信分数。
             work.add('original_position_hits')
             return _LocalLocation(track.origin, 0.0, 'original_position')
     work.add('full_search_attempts')
-    possible = {track.origin, track.origin + rh - ch}
-    scores = {position: 0.0 for position in possible}
-    if track.gray is None:
-        track.gray = cv.cvtColor(reference, cv.COLOR_RGB2GRAY)
-    rg = track.gray
-    cg = crop_gray if crop_gray is not None else cv.cvtColor(crop, cv.COLOR_RGB2GRAY)
-    if config.local_search_reuse:
-        if track.search_data is None:
-            track.search_data = _LocalSearchData(rg)
-        reference_data = track.search_data
-        crop_data = crop_data if crop_data is not None else _LocalSearchData(cg)
-    else:
-        reference_data, crop_data = _LocalSearchData(rg), _LocalSearchData(cg)
-    for source_data, target_data, reverse in ((crop_data, reference_data, False), (reference_data, crop_data, True)):
-        source, target = source_data.gray, target_data.gray
-        sh, th = len(source), len(target)
-        strip_height = min(24, max(8, sh // 3))
-        if strip_height > th:
-            continue
-        for y, patch in source_data.templates(work):
-            score, x, match_y = work.peak(source_data, target_data, y, patch)
-            if score < config.local_template_threshold or abs(x - 2) > 1:
+    with work.measure('position_search_work_s'):
+        possible = {track.origin, track.origin + rh - ch}
+        scores = {position: 0.0 for position in possible}
+        if track.gray is None:
+            track.gray = cv.cvtColor(reference, cv.COLOR_RGB2GRAY)
+        rg = track.gray
+        cg = crop_gray if crop_gray is not None else cv.cvtColor(crop, cv.COLOR_RGB2GRAY)
+        if config.local_search_reuse:
+            if track.search_data is None:
+                track.search_data = _LocalSearchData(rg)
+            reference_data = track.search_data
+            crop_data = crop_data if crop_data is not None else _LocalSearchData(cg)
+        else:
+            reference_data, crop_data = _LocalSearchData(rg), _LocalSearchData(cg)
+        for source_data, target_data, reverse in ((crop_data, reference_data, False), (reference_data, crop_data, True)):
+            source, target = source_data.gray, target_data.gray
+            sh, th = len(source), len(target)
+            strip_height = min(24, max(8, sh // 3))
+            if strip_height > th:
                 continue
-            position = track.origin + (y - match_y if reverse else match_y - y)
-            for adjustment in (-1, 0, 1):
-                possible.add(position + adjustment)
-                scores[position + adjustment] = score
+            for y, patch in source_data.templates(work):
+                score, x, match_y = work.peak(source_data, target_data, y, patch)
+                if score < config.local_template_threshold or abs(x - 2) > 1:
+                    continue
+                position = track.origin + (y - match_y if reverse else match_y - y)
+                for adjustment in (-1, 0, 1):
+                    possible.add(position + adjustment)
+                    scores[position + adjustment] = score
     best = None
     for position in sorted(possible):
         top, bottom = max(track.origin, position), min(track.origin + rh, position + ch)
@@ -1472,10 +1537,7 @@ def _locate_local_content(track, crop, config, crop_gray=None, work=None, crop_d
             continue
         left = reference[top - track.origin:bottom - track.origin, 2:-2]
         right = crop[top - position:bottom - position, 2:-2]
-        if not _strict_region_equal(left, right, config):
-            continue
-        # 两幅有内容的图不能仅靠一段白底建立关系。
-        if left.std() < 2 and (reference.std() >= 3 or crop.std() >= 3):
+        if not work.equal(left, right, reference, crop):
             continue
         value = (overlap, scores.get(position, 0), -abs(position - track.origin))
         if best is None or value > best[0]:
@@ -1577,11 +1639,23 @@ def _analyze_local_content(candidates, config):
         performance = {key: int(work.counts[key]) for key in (
             'pair_attempts', 'original_position_checks', 'original_position_hits',
             'full_search_attempts', 'template_calls', 'template_cache_hits',
-            'preparations', 'preparation_reuses', 'failed_pairs', 'accepted_matches')}
+            'preparations', 'preparation_reuses', 'failed_pairs', 'accepted_matches',
+            'width_mismatches', 'strict_checks')}
+        elapsed = time.perf_counter() - started
+        comparison = work.counts['comparison_wall_s']
+        background = work.counts['background_strict_wall_s']
         performance.update(input_frames=len(candidates),
-                           elapsed_s=round(time.perf_counter() - started, 4),
+                           elapsed_s=round(elapsed, 4), completed='analysis' in locals(),
                            template_search_work_s=round(work.counts['template_search_s'], 4),
-                           match_workers=config.local_match_workers)
+                           match_workers=config.local_match_workers,
+                           timing_schema='local-cost-v1',
+                           timing_breakdown={
+                               'comparison_wall_s': round(comparison, 4),
+                               'background_strict_wall_s': round(background, 4),
+                               'other_preparation_wall_s': round(max(0., elapsed - comparison - background), 4),
+                               'position_search_work_s': round(work.counts['position_search_work_s'], 4),
+                               'strict_check_work_s': round(work.counts['strict_check_work_s'], 4)},
+                           slowest_frames=work.slowest_frames)
         if 'analysis' in locals():
             analysis.performance = performance
         recorder = _PROCESS.get()
@@ -1596,120 +1670,122 @@ def _analyze_local_content_impl(candidates, config, work):
     tracks, backgrounds, fingerprints, background_keys = [], [], {}, {}
     background_descriptors = np.empty((len(candidates), 48), dtype=np.float32)
     for index, (candidate, digest, source, small, boxes, background) in enumerate(_local_views(candidates, config, fingerprints)):
-        identity = id(candidate)
-        candidate.evidence_ids = ()
-        analysis.coverage[identity] = set()
-        if digest in fingerprints:
-            previous = fingerprints[digest]
-            analysis.details[identity] = {**analysis.details[id(previous)], 'exact_repeat_of': previous.time}
-            analysis.quality[identity] = analysis.quality[id(previous)]
-            analysis.descriptors[identity] = analysis.descriptors[id(previous)]
-            for track in tracks:
-                old = next((o for o in track.observations if o['candidate'] is previous), None)
-                if old is not None:
-                    track.observations.append({**old, 'candidate': candidate})
-            background_id = analysis.details[identity]['background_id']
-            analysis.coverage[identity].add(background_id)
-            continue
-        fingerprints[digest] = candidate
-        height, width = source.shape[:2]
-        scale = min(1.0, config.local_analysis_max_edge / max(height, width))
-        fallback = not boxes
-        if fallback:
-            boxes = [(0, 0, small.shape[1], small.shape[0])]
-        masked = small.copy()
-        regions, exposures, clipped_edges, sharpness, motion = [], [], [], [], []
-        for x, y, w, h in boxes:
-            x0, y0 = round(x / scale), round(y / scale)
-            x1, y1 = min(width, round((x + w) / scale)), min(height, round((y + h) / scale))
-            source_crop = source[y0:y1, x0:x1]
-            # 局部卡片保留原图采样尺度。分别按可见高度缩放会改变字形，
-            # 使同一卡片的半张/全张无法通过严格重叠检查。
+        with work.frame(candidate, index, source):
+            identity = id(candidate)
+            candidate.evidence_ids = ()
+            analysis.coverage[identity] = set()
+            if digest in fingerprints:
+                previous = fingerprints[digest]
+                analysis.details[identity] = {**analysis.details[id(previous)], 'exact_repeat_of': previous.time}
+                analysis.quality[identity] = analysis.quality[id(previous)]
+                analysis.descriptors[identity] = analysis.descriptors[id(previous)]
+                for track in tracks:
+                    old = next((o for o in track.observations if o['candidate'] is previous), None)
+                    if old is not None:
+                        track.observations.append({**old, 'candidate': candidate})
+                background_id = analysis.details[identity]['background_id']
+                analysis.coverage[identity].add(background_id)
+                continue
+            fingerprints[digest] = candidate
+            height, width = source.shape[:2]
+            scale = min(1.0, config.local_analysis_max_edge / max(height, width))
+            fallback = not boxes
             if fallback:
-                crop = source_crop[2:-2].copy() if source_crop.shape[1] <= 320 else small[2:-2].copy()
-            else:
-                crop = source_crop[2:-2].copy()
-            kind = 'scene' if fallback else 'local'
-            ratio = w / small.shape[1]
-            matched = None
-            crop_color = np.median(crop, axis=(0, 1))
-            crop_gray = cv.cvtColor(crop, cv.COLOR_RGB2GRAY)
-            crop_data = _LocalSearchData(crop_gray)
-            active = [track for track in tracks if track.pixels is not None and track.kind == kind]
-            # 位移跟踪只检查时间上邻近的内容；跨时间的完全重复由文件标记复用。
-            # 整页逐一匹配几十个旧页面既不能解释操作，还会使动态视频耗时失控。
-            recent = sorted(active, key=lambda t: (-t.last_index, t.index))[:1 if fallback else 8]
-            eligible = [track for track in recent if .85 <= ratio / track.width_ratio <= 1.18
-                        and not (fallback and np.abs(crop_color - track.color).max() > 40)]
-            for track, location in work.comparisons(eligible, crop, crop_gray, crop_data):
-                if location is not None and _extend_local_track(track, crop, location[0]):
-                    matched = track, location
-                    work.add('accepted_matches')
-                    break
-            if matched is None:
-                track = _LocalTrack(len(tracks), crop.copy(), 0, ratio, kind, index)
-                track.color, track.gray = crop_color, crop_gray
-                if fallback and float(crop_gray.std()) < 2:
-                    track.reliable = not any(old.gray is not None and float(old.gray.std()) < 2
-                                             and np.abs(old.color - crop_color).max() <= 8 for old in active)
-                tracks.append(track)
-                position, confidence = 0, 0.0
-                match_method = 'new_reference'
-            else:
-                track, location = matched
-                position, confidence = location
-                match_method = location.method
-            track.last_index = index
-            track.observations.append({'candidate': candidate, 'top': position, 'bottom': position + len(crop)})
-            clipped = 0 if fallback else sum((x <= 1, y <= 1, x + w >= small.shape[1] - 1,
-                                              y + h >= small.shape[0] - 1))
-            clarity = float(cv.Laplacian(crop_gray, cv.CV_32F).var())
-            exposures.append(len(crop))
-            clipped_edges.append(clipped)
-            sharpness.append(clarity)
-            motion.append(abs(position))
-            regions.append({'track': track.index, 'kind': kind, 'box': [x0, y0, x1 - x0, y1 - y0],
-                            'possible_clipping': bool(clipped),
-                            'match_confidence': None if match_method == 'original_position' else round(float(confidence), 4),
-                            'match_method': match_method,
-                            'visible_range': [position, position + len(crop)]})
-            masked[y:y + h, x:x + w] = background
-        signature = cv.resize(masked, (96, 160), interpolation=cv.INTER_AREA)
-        background_key = hashlib.sha256(signature.tobytes()).digest()
-        background_index = background_keys.get(background_key)
-        descriptor = cv.resize(signature, (4, 4), interpolation=cv.INTER_AREA).astype(np.float32).ravel() / 255
-        if background_index is None and backgrounds:
-            distances = np.mean((background_descriptors[:len(backgrounds)] - descriptor) ** 2, axis=1)
-            possible = np.flatnonzero(distances <= (config.global_dedup_rms_threshold + 2 / 255) ** 2)
-            background_index = next((int(i) for i in possible
-                                     if _strict_region_equal(signature, backgrounds[i], config)), None)
-        if background_index is None:
-            background_index = len(backgrounds)
-            uniform = bool(np.all(signature == signature[0, 0]))
-            weak_background = uniform and any(ref.shape[:2] == (1, 1)
-                                               and np.abs(ref[0, 0].astype(np.int16) - signature[0, 0]).max() <= 8
-                                               for ref in backgrounds)
-            backgrounds.append(signature[:1, :1].copy() if np.all(signature == signature[0, 0]) else signature)
-            background_descriptors[background_index] = descriptor
-            key = f'b{background_index:04d}'
-            analysis.units[key] = {'id': key, 'kind': 'background', 'weight': 0.0 if weak_background else .15}
-        background_keys[background_key] = background_index
-        background_id = f'b{background_index:04d}'
-        analysis.units.setdefault(background_id, {'id': background_id, 'kind': 'background', 'weight': .15})
-        analysis.coverage[identity].add(background_id)
-        analysis.quality[identity] = (sum(exposures), -sum(clipped_edges),
-                                      round(sum(sharpness) / max(1, len(sharpness)), 4), -sum(motion))
-        analysis.descriptors[identity] = cv.resize(small, (12, 20), interpolation=cv.INTER_AREA).astype(np.float32) / 255
-        analysis.details[identity] = {'regions': regions, 'background_id': background_id,
-                                      'note': '局部区域和裁切线索，不代表已识别弹窗用途或确认完整性'}
-        # 活跃跟踪最多保存 32 份参考图；更早的内容只留覆盖区间和记录。
-        active = sorted((track for track in tracks if track.pixels is not None),
-                        key=lambda t: (t.last_index, t.index))
-        for old in active[:-32]:
-            old.bins = _local_track_bins(old, config)
-            old.pixels = None
-            old.gray = None
-            old.search_data = None
+                boxes = [(0, 0, small.shape[1], small.shape[0])]
+            masked = small.copy()
+            regions, exposures, clipped_edges, sharpness, motion = [], [], [], [], []
+            for x, y, w, h in boxes:
+                x0, y0 = round(x / scale), round(y / scale)
+                x1, y1 = min(width, round((x + w) / scale)), min(height, round((y + h) / scale))
+                source_crop = source[y0:y1, x0:x1]
+                # 局部卡片保留原图采样尺度。分别按可见高度缩放会改变字形，
+                # 使同一卡片的半张/全张无法通过严格重叠检查。
+                if fallback:
+                    crop = source_crop[2:-2].copy() if source_crop.shape[1] <= 320 else small[2:-2].copy()
+                else:
+                    crop = source_crop[2:-2].copy()
+                work.frame_info['regions'].append([int(crop.shape[1]), int(crop.shape[0])])
+                kind = 'scene' if fallback else 'local'
+                ratio = w / small.shape[1]
+                matched = None
+                crop_color = np.median(crop, axis=(0, 1))
+                crop_gray = cv.cvtColor(crop, cv.COLOR_RGB2GRAY)
+                crop_data = _LocalSearchData(crop_gray)
+                active = [track for track in tracks if track.pixels is not None and track.kind == kind]
+                # 位移跟踪只检查时间上邻近的内容；跨时间的完全重复由文件标记复用。
+                # 整页逐一匹配几十个旧页面既不能解释操作，还会使动态视频耗时失控。
+                recent = sorted(active, key=lambda t: (-t.last_index, t.index))[:1 if fallback else 8]
+                eligible = [track for track in recent if .85 <= ratio / track.width_ratio <= 1.18
+                            and not (fallback and np.abs(crop_color - track.color).max() > 40)]
+                for track, location in work.comparisons(eligible, crop, crop_gray, crop_data):
+                    if location is not None and _extend_local_track(track, crop, location[0]):
+                        matched = track, location
+                        work.add('accepted_matches')
+                        break
+                if matched is None:
+                    track = _LocalTrack(len(tracks), crop.copy(), 0, ratio, kind, index)
+                    track.color, track.gray = crop_color, crop_gray
+                    if fallback and float(crop_gray.std()) < 2:
+                        track.reliable = not any(old.gray is not None and float(old.gray.std()) < 2
+                                                 and np.abs(old.color - crop_color).max() <= 8 for old in active)
+                    tracks.append(track)
+                    position, confidence = 0, 0.0
+                    match_method = 'new_reference'
+                else:
+                    track, location = matched
+                    position, confidence = location
+                    match_method = location.method
+                track.last_index = index
+                track.observations.append({'candidate': candidate, 'top': position, 'bottom': position + len(crop)})
+                clipped = 0 if fallback else sum((x <= 1, y <= 1, x + w >= small.shape[1] - 1,
+                                                  y + h >= small.shape[0] - 1))
+                clarity = float(cv.Laplacian(crop_gray, cv.CV_32F).var())
+                exposures.append(len(crop))
+                clipped_edges.append(clipped)
+                sharpness.append(clarity)
+                motion.append(abs(position))
+                regions.append({'track': track.index, 'kind': kind, 'box': [x0, y0, x1 - x0, y1 - y0],
+                                'possible_clipping': bool(clipped),
+                                'match_confidence': None if match_method == 'original_position' else round(float(confidence), 4),
+                                'match_method': match_method,
+                                'visible_range': [position, position + len(crop)]})
+                masked[y:y + h, x:x + w] = background
+            signature = cv.resize(masked, (96, 160), interpolation=cv.INTER_AREA)
+            background_key = hashlib.sha256(signature.tobytes()).digest()
+            background_index = background_keys.get(background_key)
+            descriptor = cv.resize(signature, (4, 4), interpolation=cv.INTER_AREA).astype(np.float32).ravel() / 255
+            if background_index is None and backgrounds:
+                distances = np.mean((background_descriptors[:len(backgrounds)] - descriptor) ** 2, axis=1)
+                possible = np.flatnonzero(distances <= (config.global_dedup_rms_threshold + 2 / 255) ** 2)
+                background_index = next((int(i) for i in possible
+                                         if work.background_equal(signature, backgrounds[i])), None)
+            if background_index is None:
+                background_index = len(backgrounds)
+                uniform = bool(np.all(signature == signature[0, 0]))
+                weak_background = uniform and any(ref.shape[:2] == (1, 1)
+                                                   and np.abs(ref[0, 0].astype(np.int16) - signature[0, 0]).max() <= 8
+                                                   for ref in backgrounds)
+                backgrounds.append(signature[:1, :1].copy() if np.all(signature == signature[0, 0]) else signature)
+                background_descriptors[background_index] = descriptor
+                key = f'b{background_index:04d}'
+                analysis.units[key] = {'id': key, 'kind': 'background', 'weight': 0.0 if weak_background else .15}
+            background_keys[background_key] = background_index
+            background_id = f'b{background_index:04d}'
+            analysis.units.setdefault(background_id, {'id': background_id, 'kind': 'background', 'weight': .15})
+            analysis.coverage[identity].add(background_id)
+            analysis.quality[identity] = (sum(exposures), -sum(clipped_edges),
+                                          round(sum(sharpness) / max(1, len(sharpness)), 4), -sum(motion))
+            analysis.descriptors[identity] = cv.resize(small, (12, 20), interpolation=cv.INTER_AREA).astype(np.float32) / 255
+            analysis.details[identity] = {'regions': regions, 'background_id': background_id,
+                                          'note': '局部区域和裁切线索，不代表已识别弹窗用途或确认完整性'}
+            # 活跃跟踪最多保存 32 份参考图；更早的内容只留覆盖区间和记录。
+            active = sorted((track for track in tracks if track.pixels is not None),
+                            key=lambda t: (t.last_index, t.index))
+            for old in active[:-32]:
+                old.bins = _local_track_bins(old, config)
+                old.pixels = None
+                old.gray = None
+                old.search_data = None
     for track in tracks:
         bins = _local_track_bins(track, config)
         for number, rows in bins:

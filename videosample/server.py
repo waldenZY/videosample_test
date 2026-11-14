@@ -213,6 +213,10 @@ def chain_statistics(run):
     for key in ('pair_attempts', 'original_position_hits', 'full_search_attempts',
                 'template_calls', 'template_cache_hits', 'failed_pairs'):
         local_statistics[key] = metric(value.get(key) for value in local)
+    local_statistics['timing_breakdown'] = {
+        key: metric((value.get('timing_breakdown') or {}).get(key) for value in local)
+        for key in ('comparison_wall_s', 'background_strict_wall_s', 'other_preparation_wall_s',
+                    'position_search_work_s', 'strict_check_work_s')}
     return {"total_samples": len(rows),
             "selected_samples": sum(row.get("status") != "skipped" for row in rows),
             "successful_samples": len(successful),

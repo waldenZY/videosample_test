@@ -35,11 +35,15 @@ def test_local_search_statistics_exclude_old_missing_and_failed_samples():
              'original_position_hits': 4, 'full_search_attempts': 10, 'template_calls': 25}},
         {'status': 'done'},  # 历史记录不按 0 秒计入。
         {'status': 'done', 'local_analysis': {'elapsed_s': 6, 'input_frames': 80,
-             'original_position_hits': 8, 'full_search_attempts': 30, 'template_calls': 100}},
-        {'status': 'error', 'local_analysis': {'elapsed_s': 99}}]})['local_analysis']
+             'original_position_hits': 8, 'full_search_attempts': 30, 'template_calls': 100,
+             'timing_breakdown': {'comparison_wall_s': 4, 'position_search_work_s': 5}}},
+        {'status': 'error', 'local_analysis': {'elapsed_s': 99,
+             'timing_breakdown': {'comparison_wall_s': 90}}}]})['local_analysis']
     assert stats['samples'] == 2
     assert stats['elapsed_s'] == {'samples': 2, 'total': 8, 'mean': 4}
     assert stats['full_search_attempts']['mean'] == 20
+    assert stats['timing_breakdown']['comparison_wall_s'] == {'samples': 1, 'total': 4, 'mean': 4}
+    assert stats['timing_breakdown']['position_search_work_s']['mean'] == 5
     assert server.chain_statistics({'rows': [{'status': 'done'}]})['local_analysis']['elapsed_s']['mean'] is None
 
 

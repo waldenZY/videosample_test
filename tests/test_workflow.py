@@ -85,6 +85,10 @@ def test_adaptive_selection_is_output_without_another_filter(tmp_path, video):
     assert trace['local_analysis'] == recorder.local_analysis
     assert trace['local_analysis']['input_frames'] == len(recorder.stages[-2]['input_ids'])
     assert trace['local_analysis']['elapsed_s'] >= 0
+    assert trace['local_analysis']['timing_schema'] == 'local-cost-v1'
+    assert len(trace['local_analysis']['slowest_frames']) <= 3
+    candidates_by_id = {frame['id'] for frame in trace['frames']}
+    assert all(frame['frame_id'] in candidates_by_id for frame in trace['local_analysis']['slowest_frames'])
     assert metadata['config']['analysis_mask_box'] == list(media.DEFAULT_ANALYSIS_MASK_BOX)
     for path, identity in zip(frames, recorder.stages[-1]['output_ids']):
         assert path.read_bytes() == (tmp_path / 'process/candidates' / f'{identity}.jpg').read_bytes()
