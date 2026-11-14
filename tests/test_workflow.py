@@ -81,6 +81,10 @@ def test_adaptive_selection_is_output_without_another_filter(tmp_path, video):
     metadata = json.loads((tmp_path / 'final/keyframes.json').read_text(encoding='utf-8'))
     assert metadata['selection']['selected_count'] == len(frames)
     assert 'final_dedup_removed' not in metadata
+    trace = json.loads((tmp_path / 'process/trace.json').read_text(encoding='utf-8'))
+    assert trace['local_analysis'] == recorder.local_analysis
+    assert trace['local_analysis']['input_frames'] == len(recorder.stages[-2]['input_ids'])
+    assert trace['local_analysis']['elapsed_s'] >= 0
     assert metadata['config']['analysis_mask_box'] == list(media.DEFAULT_ANALYSIS_MASK_BOX)
     for path, identity in zip(frames, recorder.stages[-1]['output_ids']):
         assert path.read_bytes() == (tmp_path / 'process/candidates' / f'{identity}.jpg').read_bytes()

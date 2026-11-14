@@ -32,6 +32,17 @@ vm.runInContext('renderSelection({frame_count:10})',context);assert.equal(elemen
 const value=context.renderDistribution({output_distribution:{samples:2,counts:{'1-5':1,'6-10':0,'11-14':1,'15':0,other:0}},adaptive_selection:{samples:2,hit_limit_count:1,hit_limit_rate:.5,stop_reasons:{covered:1,no_reliable_addition:0,limit_reached:1}}});
 assert(value.includes('50.0%'));assert(value.includes('11-14 张：1 题'));
 assert(context.renderDistribution({}).includes('暂无张数分布'));
+vm.runInContext(`renderTimings({local_analysis:{elapsed_s:2.31,input_frames:89,original_position_hits:18,full_search_attempts:30,failed_pairs:12,template_calls:90,template_cache_hits:4,preparation_reuses:20,match_workers:2}})`,context);
+assert.equal(element('localPerformance').hidden,false);
+assert(element('localPerformance').innerHTML.includes('2.31 秒'));
+assert(element('localPerformance').innerHTML.includes('完整搜索 30 次'));
+assert(element('localPerformance').innerHTML.includes('不是丢帧'));
+vm.runInContext('renderTimings({})',context);
+assert.equal(element('localPerformance').hidden,true);
+vm.runInContext(`current={chains:[{name:'实验',statistics:{successful_samples:1,selected_samples:1,failed_samples:0,local_analysis:{elapsed_s:{samples:1,mean:2.31},original_position_hits:{mean:18},full_search_attempts:{mean:30}}}}]};renderChainStatistics()`,context);
+assert(element('chainStatisticsRows').innerHTML.includes('局部检查平均 2.31 秒'));
+vm.runInContext(`current={chains:[{name:'旧记录',statistics:{successful_samples:1,selected_samples:1,failed_samples:0}}]};renderChainStatistics()`,context);
+assert(element('chainStatisticsRows').innerHTML.includes('该版本未记录'));
 const html=fs.readFileSync('static/index.html','utf8');
 assert(html.includes('自适应，最多 15 张'));assert(html.includes('数量分布 / 停止情况'));
 '''

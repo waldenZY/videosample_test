@@ -29,6 +29,20 @@ def test_empty_and_zero_statistics():
     assert stats["initial_frames"] == {"samples": 1, "total": 0, "mean": 0}
 
 
+def test_local_search_statistics_exclude_old_missing_and_failed_samples():
+    stats = server.chain_statistics({'rows': [
+        {'status': 'done', 'local_analysis': {'elapsed_s': 2, 'input_frames': 20,
+             'original_position_hits': 4, 'full_search_attempts': 10, 'template_calls': 25}},
+        {'status': 'done'},  # 历史记录不按 0 秒计入。
+        {'status': 'done', 'local_analysis': {'elapsed_s': 6, 'input_frames': 80,
+             'original_position_hits': 8, 'full_search_attempts': 30, 'template_calls': 100}},
+        {'status': 'error', 'local_analysis': {'elapsed_s': 99}}]})['local_analysis']
+    assert stats['samples'] == 2
+    assert stats['elapsed_s'] == {'samples': 2, 'total': 8, 'mean': 4}
+    assert stats['full_search_attempts']['mean'] == 20
+    assert server.chain_statistics({'rows': [{'status': 'done'}]})['local_analysis']['elapsed_s']['mean'] is None
+
+
 def test_output_distribution_and_hit_limit_use_actual_stop_reason():
     rows = []
     for count, reason, seconds in [(4, 'covered', 3), (15, 'limit_reached', 26),

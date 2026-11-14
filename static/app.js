@@ -39,6 +39,7 @@ async function openSample(index){if(currentIndex===index&&!$('sample').hidden){c
  try{const data=await api(`/api/runs/${current.id}/items/${index}/trace`);if(token!==detailToken)return;traceData=data;stageId=data.stages.at(-1)?.id||'collected';$('frameFilter').value='kept';$('sampleInfo').textContent=`${current.version} · ${row.duration?.toFixed(2)||'—'} 秒视频 · ${data.frames.length} 张候选图 · 最终 ${row.frame_count??'尚未完成'} 张${row.error?' · '+row.error:''}`;renderStages();renderGallery()}catch(e){if(token===detailToken)$('sampleInfo').textContent=row.error||e.message}}
 function renderTimings(row){
  renderSelection(row);
+ renderLocalPerformance(row?.local_analysis);
  const timings=row?.timings_s;$('timingDetails').hidden=!timings;
  if(!timings){$('timingBreakdown').innerHTML='';return;}
  const labels={video_prepare:'视频准备 / 下载及等待',probe:'读取视频信息',fingerprint:'核对视频内容',extraction:'抽帧处理合计'};
@@ -47,6 +48,11 @@ function renderTimings(row){
  const lines=Object.entries(labels).filter(([key])=>typeof timings[key]==='number').map(([key,name])=>`<div class="timing-line"><span>${name}</span><strong>${timings[key].toFixed(2)} 秒</strong></div>`).join('');
  const stages=Object.entries(timings.stages||{}).map(([key,value])=>`<div class="timing-line timing-stage"><span>${esc(stageLabels[key]||stageNames.get(key)||key)}</span><strong>${Number(value).toFixed(2)} 秒</strong></div>`).join('');
  $('timingBreakdown').innerHTML=lines+(stages?'<p class="small muted">下面为抽帧合计内部的分项，不与上面的合计重复相加。</p>'+stages:'<p class="small muted">base 保持原实现，仅显示抽帧总体耗时。</p>');
+}
+function renderLocalPerformance(value){
+ const panel=$('localPerformance');panel.hidden=!value;
+ if(!value){panel.innerHTML='';return;}
+ panel.innerHTML=`<strong>局部检查：${Number(value.elapsed_s).toFixed(2)} 秒 · 输入 ${esc(value.input_frames)} 张</strong><p>原位直接匹配 ${esc(value.original_position_hits)} 次 · 完整搜索 ${esc(value.full_search_attempts)} 次 · 未找到对应内容 ${esc(value.failed_pairs)} 次</p><details><summary>查看搜索开销</summary><p>实际图案搜索 ${esc(value.template_calls)} 次 · 复用相同搜索 ${esc(value.template_cache_hits)} 次 · 复用图案准备 ${esc(value.preparation_reuses)} 次 · 搜索线程上限 ${esc(value.match_workers)}</p><p class="small muted">一次完整搜索会尝试多个小图案；未匹配只表示这次参考图不适合，不是丢帧。以上次数统计实际执行的比较，可能含并行预先计算。局部检查耗时已包含在各阶段耗时中。</p></details>`;
 }
 function renderStages(){$('stages').innerHTML=traceData.stages.map(s=>`<button data-stage="${s.id}" class="${stageId===s.id?'active':''}">${esc(s.title)} · ${s.output_ids.length}</button>`).join('')}
 function renderGallery(){const stage=traceData?.stages.find(s=>s.id===stageId);if(!stage)return;const filter=$('frameFilter').value;$('stageSummary').textContent=stage.id==='collected'?`收集 ${stage.output_ids.length} 张`:`本步输入 ${stage.input_ids.length} 张 · 保留 ${stage.output_ids.length} 张 · 丢弃 ${stage.removed_ids.length} 张`;
@@ -92,7 +98,7 @@ function renderChainStatistics(){
   if(!metric||metric.mean===null||metric.mean===undefined)return '<span class="muted">暂无数据</span>';
   return `<strong>${Number(metric.mean).toFixed(unit==='秒'?2:1)} ${unit}/题</strong><div class="muted small">${total?'总计 '+Number(metric.total).toLocaleString()+' '+unit+' · ':''}n=${metric.samples}</div>`;
  }
- $('chainStatisticsRows').innerHTML=chains.map(chain=>{const stats=chain.statistics;if(!stats)return '';return `<tr><td><strong>${esc(chain.name)}${chain.frame_limit?' · 最多 '+chain.frame_limit+' 张':''}</strong><div class="muted small">${esc(chain.version||'')}</div></td><td>${stats.successful_samples} / ${stats.selected_samples}<div class="muted small">失败 / 中断 ${stats.failed_samples}</div></td><td>${cell(stats.sample_time_s,'秒')}</td><td>${cell(stats.extraction_time_s,'秒')}${stats.extraction_max_s==null?'':`<div class="muted small">最长 ${Number(stats.extraction_max_s).toFixed(2)} 秒</div>`}</td><td>${cell(stats.initial_frames,'张',true)}</td><td>${cell(stats.final_frames,'张',true)}</td><td>${renderDistribution(stats)}</td></tr>`}).join('');
+ $('chainStatisticsRows').innerHTML=chains.map(chain=>{const stats=chain.statistics;if(!stats)return '';const local=stats.local_analysis;const localInfo=local?.elapsed_s?.samples?`局部检查平均 ${Number(local.elapsed_s.mean).toFixed(2)} 秒（n=${local.elapsed_s.samples}）<br>平均原位匹配 ${Number(local.original_position_hits.mean).toFixed(1)} 次 / 完整搜索 ${Number(local.full_search_attempts.mean).toFixed(1)} 次`:'局部搜索开销：该版本未记录';return `<tr><td><strong>${esc(chain.name)}${chain.frame_limit?' · 最多 '+chain.frame_limit+' 张':''}</strong><div class="muted small">${esc(chain.version||'')}</div></td><td>${stats.successful_samples} / ${stats.selected_samples}<div class="muted small">失败 / 中断 ${stats.failed_samples}</div></td><td>${cell(stats.sample_time_s,'秒')}</td><td>${cell(stats.extraction_time_s,'秒')}${stats.extraction_max_s==null?'':`<div class="muted small">最长 ${Number(stats.extraction_max_s).toFixed(2)} 秒</div>`}<div class="muted small">${localInfo}</div></td><td>${cell(stats.initial_frames,'张',true)}</td><td>${cell(stats.final_frames,'张',true)}</td><td>${renderDistribution(stats)}</td></tr>`}).join('');
 }
 function renderChainTabs(){
  const chains=current.chains||[];$('chainTabs').hidden=chains.length<2;

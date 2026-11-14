@@ -206,10 +206,18 @@ def chain_statistics(run):
                   and row['selection'].get('stop_reason') in {'covered', 'no_reliable_addition', 'limit_reached'}]
     reasons = {key: sum(selection['stop_reason'] == key for selection in selections)
                for key in ('covered', 'no_reliable_addition', 'limit_reached')}
+    local = [row['local_analysis'] for row in successful if isinstance(row.get('local_analysis'), dict)]
+    local_statistics = {'samples': len(local),
+                        'elapsed_s': metric(value.get('elapsed_s') for value in local),
+                        'input_frames': metric(value.get('input_frames') for value in local)}
+    for key in ('pair_attempts', 'original_position_hits', 'full_search_attempts',
+                'template_calls', 'template_cache_hits', 'failed_pairs'):
+        local_statistics[key] = metric(value.get(key) for value in local)
     return {"total_samples": len(rows),
             "selected_samples": sum(row.get("status") != "skipped" for row in rows),
             "successful_samples": len(successful),
             "failed_samples": sum(row.get("status") in {"error", "interrupted"} for row in rows),
+            "local_analysis": local_statistics,
             "sample_time_s": metric(row.get("elapsed_s") for row in successful),
             "extraction_time_s": metric((row.get("timings_s") or {}).get("extraction") for row in successful),
             "extraction_max_s": round(max(durations), 3) if durations else None,
@@ -357,12 +365,14 @@ def process_row(identity: str, index: int):
                    initial_frame_count=getattr(recorder, "initial_frame_count", counts.get("collected")),
                    effective_config=metadata["config"],
                    selection=metadata.get('selection'),
+                   local_analysis=getattr(recorder, 'local_analysis', None),
                    stages=[{"id": stage["id"], "title": stage["title"]} for stage in recorder.stages],
                    stage_counts=counts, timings_s=timings, elapsed_s=round(time.monotonic() - started, 2))
     except Exception as exc:
         if recorder is not None and hasattr(recorder, "timing_summary"):
             timings["stages"] = recorder.timing_summary()
         update_row(identity, index, status="error", message="本题失败", error=str(exc),
+                   local_analysis=getattr(recorder, 'local_analysis', None),
                    timings_s=timings, elapsed_s=round(time.monotonic() - started, 2))
 
 

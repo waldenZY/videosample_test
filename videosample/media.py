@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from collections import Counter, OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -31,7 +32,7 @@ from pathlib import Path
 import numpy as np
 
 
-KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4.6"
+KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4.7"
 DEFAULT_TASK_START_TIME = 7.0
 DEFAULT_ANALYSIS_MASK_BOX = (.63, .005, .74, .040)
 
@@ -150,6 +151,7 @@ class _ProcessRecord:
         self.notes = {}
         self.initial_frame_count = None
         self.selection = None
+        self.local_analysis = None
         self.timings = {}
         self.record_io_s = 0.0
         self.last_stage_end = time.perf_counter()
@@ -213,6 +215,7 @@ class _ProcessRecord:
         payload = {"algorithm_version": KEYFRAME_ALGORITHM_VERSION,
                    "initial_frame_count": self.initial_frame_count,
                    "selection": self.selection,
+                   "local_analysis": self.local_analysis,
                    "frames": self.frames, "stages": self.stages,
                    "timings_s": {**{key: round(value, 4) for key, value in self.timings.items()},
                                  "process_io": round(self.record_io_s, 4)}}
@@ -347,6 +350,9 @@ class KeyframeConfig:
     local_analysis_max_edge: int = 320
     local_template_threshold: float = 0.90
     local_content_bin_height: int = 24
+    local_fast_alignment: bool = True
+    local_search_reuse: bool = True
+    local_match_workers: int = 2
     analysis_mask_box: tuple | None = DEFAULT_ANALYSIS_MASK_BOX
     scroll_dedup_enabled: bool = True
     scroll_analysis_max_edge: int = 800
@@ -390,6 +396,12 @@ class KeyframeConfig:
             raise ValueError("局部分析尺寸或内容分段过小")
         if not 0 < self.local_template_threshold <= 1:
             raise ValueError("局部匹配阈值必须在 0 到 1 之间")
+        for name in ('local_fast_alignment', 'local_search_reuse'):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} 必须为布尔值")
+        if (isinstance(self.local_match_workers, bool) or not isinstance(self.local_match_workers, Integral)
+                or not 1 <= self.local_match_workers <= 4):
+            raise ValueError("local_match_workers 必须为 1 到 4 的整数")
         if self.sample_fps <= 0:
             raise ValueError("sample_fps 必须大于 0")
         if self.analysis_mask_box is not None:
@@ -1290,6 +1302,7 @@ class _LocalTrack:
     color: np.ndarray | None = None
     gray: np.ndarray | None = None
     reliable: bool = True
+    search_data: object = None
 
 
 @dataclass
@@ -1303,34 +1316,148 @@ class _LocalAnalysis:
     details: dict = field(default_factory=dict)
     descriptors: dict = field(default_factory=dict)
     summary: dict = field(default_factory=dict)
+    performance: dict = field(default_factory=dict)
 
 
-def _locate_local_content(track, crop, config, crop_gray=None):
+class _LocalSearchData:
+    """一份不再改写的灰度图；纹理条及精确摘要按需计算。"""
+    def __init__(self, gray):
+        self.gray = gray
+        self._templates = None
+        self._digest = None
+        self._lock = threading.Lock()
+
+    def templates(self, work):
+        with self._lock:
+            if self._templates is not None:
+                work.add('preparation_reuses')
+                return self._templates
+            sh = len(self.gray)
+            height = min(24, max(8, sh // 3))
+            energy = np.mean(np.abs(np.diff(self.gray.astype(np.float32), axis=1)), axis=1)
+            textured = int(np.argmax(np.convolve(energy, np.ones(height), mode='valid')))
+            self._templates = [(y, self.gray[y:y + height, 2:-2])
+                               for y in sorted({0, max(0, (sh - height) // 2), sh - height, textured})
+                               if not float(self.gray[y:y + height, 2:-2].std()) < 3]
+            work.add('preparations')
+            return self._templates
+
+    def digest(self):
+        with self._lock:
+            if self._digest is None:
+                self._digest = (self.gray.shape, hashlib.sha256(self.gray.tobytes()).digest())
+            return self._digest
+
+
+class _LocalWork:
+    """仅限一次局部分析的计数、精确搜索缓存和可选线程池。"""
+    def __init__(self, config):
+        self.config = config
+        self.counts = Counter()
+        self.peaks = OrderedDict()
+        self.lock = threading.Lock()
+        self.pool = None
+
+    def add(self, key, value=1):
+        with self.lock:
+            self.counts[key] += value
+
+    def peak(self, source, target, y, patch):
+        cv = _local_cv()
+        key = (source.digest(), target.digest(), y, patch.shape) if self.config.local_search_reuse else None
+        if key is not None:
+            with self.lock:
+                if key in self.peaks:
+                    self.peaks.move_to_end(key)
+                    self.counts['template_cache_hits'] += 1
+                    return self.peaks[key]
+        started = time.perf_counter()
+        matches = cv.matchTemplate(target.gray, patch, cv.TM_CCOEFF_NORMED)
+        _, score, _, (x, match_y) = cv.minMaxLoc(matches)
+        self.add('template_search_s', time.perf_counter() - started)
+        self.add('template_calls')
+        result = (score, x, match_y)
+        if key is not None:
+            with self.lock:
+                self.peaks[key] = result
+                self.peaks.move_to_end(key)
+                if len(self.peaks) > 512:
+                    self.peaks.popitem(last=False)
+        return result
+
+    def comparisons(self, tracks, crop, crop_gray, crop_data):
+        """原顺序裁决。最近参考先串行，其余小批并行，整批结束才允许改写参考图。"""
+        def locate(track):
+            return _locate_local_content(track, crop, self.config, crop_gray, self, crop_data)
+        if not tracks:
+            return
+        yield tracks[0], locate(tracks[0])
+        workers = self.config.local_match_workers
+        for start in range(1, len(tracks), workers):
+            wave = tracks[start:start + workers]
+            if workers == 1:
+                results = [locate(wave[0])]
+            else:
+                if self.pool is None:
+                    self.pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix='local-match')
+                # 等待整批任务结束；若一个失败，也在 wrapper 的 finally 中等待并清理。
+                results = list(self.pool.map(locate, wave))
+            yield from zip(wave, results)
+
+    def close(self):
+        if self.pool is not None:
+            self.pool.shutdown(wait=True, cancel_futures=True)
+        self.peaks.clear()
+
+
+class _LocalLocation(tuple):
+    def __new__(cls, position, confidence, method):
+        result = super().__new__(cls, (position, confidence))
+        result.method = method
+        return result
+
+
+def _locate_local_content(track, crop, config, crop_gray=None, work=None, crop_data=None):
     """用有纹理的小条匹配位移，再严格核对整个重叠区；不靠匹配分数合并文字。"""
     cv = _local_cv()
+    work = work if work is not None else _LocalWork(config)
+    work.add('pair_attempts')
     reference = track.pixels
     if reference.shape[1] != crop.shape[1]:
+        work.add('failed_pairs')
         return None
     rh, ch = len(reference), len(crop)
+    if config.local_fast_alignment and rh == ch and rh >= 8:
+        work.add('original_position_checks')
+        left, right = reference[:, 2:-2], crop[:, 2:-2]
+        if (_strict_region_equal(left, right, config)
+                and not (left.std() < 2 and (reference.std() >= 3 or crop.std() >= 3))):
+            # 等高时，原位通过完整严格检查就是唯一最大重叠范围。
+            # 不伪造未执行的模板搜索置信分数。
+            work.add('original_position_hits')
+            return _LocalLocation(track.origin, 0.0, 'original_position')
+    work.add('full_search_attempts')
     possible = {track.origin, track.origin + rh - ch}
     scores = {position: 0.0 for position in possible}
     if track.gray is None:
         track.gray = cv.cvtColor(reference, cv.COLOR_RGB2GRAY)
     rg = track.gray
     cg = crop_gray if crop_gray is not None else cv.cvtColor(crop, cv.COLOR_RGB2GRAY)
-    for source, target, reverse in ((cg, rg, False), (rg, cg, True)):
+    if config.local_search_reuse:
+        if track.search_data is None:
+            track.search_data = _LocalSearchData(rg)
+        reference_data = track.search_data
+        crop_data = crop_data if crop_data is not None else _LocalSearchData(cg)
+    else:
+        reference_data, crop_data = _LocalSearchData(rg), _LocalSearchData(cg)
+    for source_data, target_data, reverse in ((crop_data, reference_data, False), (reference_data, crop_data, True)):
+        source, target = source_data.gray, target_data.gray
         sh, th = len(source), len(target)
         strip_height = min(24, max(8, sh // 3))
         if strip_height > th:
             continue
-        energy = np.mean(np.abs(np.diff(source.astype(np.float32), axis=1)), axis=1)
-        textured = int(np.argmax(np.convolve(energy, np.ones(strip_height), mode='valid')))
-        for y in sorted({0, max(0, (sh - strip_height) // 2), sh - strip_height, textured}):
-            patch = source[y:y + strip_height, 2:-2]
-            if float(patch.std()) < 3:
-                continue
-            matches = cv.matchTemplate(target, patch, cv.TM_CCOEFF_NORMED)
-            _, score, _, (x, match_y) = cv.minMaxLoc(matches)
+        for y, patch in source_data.templates(work):
+            score, x, match_y = work.peak(source_data, target_data, y, patch)
             if score < config.local_template_threshold or abs(x - 2) > 1:
                 continue
             position = track.origin + (y - match_y if reverse else match_y - y)
@@ -1353,7 +1480,10 @@ def _locate_local_content(track, crop, config, crop_gray=None):
         value = (overlap, scores.get(position, 0), -abs(position - track.origin))
         if best is None or value > best[0]:
             best = (value, position, scores.get(position, 0))
-    return None if best is None else (best[1], best[2])
+    if best is None:
+        work.add('failed_pairs')
+        return None
+    return _LocalLocation(best[1], best[2], 'template_search')
 
 
 def _extend_local_track(track, crop, position):
@@ -1369,6 +1499,7 @@ def _extend_local_track(track, crop, position):
     combined[track.origin - top:track.origin - top + len(track.pixels)] = track.pixels
     track.origin, track.pixels = top, combined
     track.gray = None
+    track.search_data = None
     track.color = np.median(combined, axis=(0, 1))
     return True
 
@@ -1436,6 +1567,29 @@ def _local_views(candidates, config, fingerprints):
 
 
 def _analyze_local_content(candidates, config):
+    work = _LocalWork(config)
+    started = time.perf_counter()
+    try:
+        analysis = _analyze_local_content_impl(candidates, config, work)
+        return analysis
+    finally:
+        work.close()
+        performance = {key: int(work.counts[key]) for key in (
+            'pair_attempts', 'original_position_checks', 'original_position_hits',
+            'full_search_attempts', 'template_calls', 'template_cache_hits',
+            'preparations', 'preparation_reuses', 'failed_pairs', 'accepted_matches')}
+        performance.update(input_frames=len(candidates),
+                           elapsed_s=round(time.perf_counter() - started, 4),
+                           template_search_work_s=round(work.counts['template_search_s'], 4),
+                           match_workers=config.local_match_workers)
+        if 'analysis' in locals():
+            analysis.performance = performance
+        recorder = _PROCESS.get()
+        if recorder is not None:
+            recorder.local_analysis = performance
+
+
+def _analyze_local_content_impl(candidates, config, work):
     """仅分析名额分配前的候选；计算过程与实验台记录完全独立。"""
     cv = _local_cv()
     analysis = _LocalAnalysis(list(candidates))
@@ -1480,18 +1634,17 @@ def _analyze_local_content(candidates, config):
             matched = None
             crop_color = np.median(crop, axis=(0, 1))
             crop_gray = cv.cvtColor(crop, cv.COLOR_RGB2GRAY)
+            crop_data = _LocalSearchData(crop_gray)
             active = [track for track in tracks if track.pixels is not None and track.kind == kind]
             # 位移跟踪只检查时间上邻近的内容；跨时间的完全重复由文件标记复用。
             # 整页逐一匹配几十个旧页面既不能解释操作，还会使动态视频耗时失控。
             recent = sorted(active, key=lambda t: (-t.last_index, t.index))[:1 if fallback else 8]
-            for track in recent:
-                if not .85 <= ratio / track.width_ratio <= 1.18:
-                    continue
-                if fallback and np.abs(crop_color - track.color).max() > 40:
-                    continue
-                location = _locate_local_content(track, crop, config, crop_gray)
+            eligible = [track for track in recent if .85 <= ratio / track.width_ratio <= 1.18
+                        and not (fallback and np.abs(crop_color - track.color).max() > 40)]
+            for track, location in work.comparisons(eligible, crop, crop_gray, crop_data):
                 if location is not None and _extend_local_track(track, crop, location[0]):
                     matched = track, location
+                    work.add('accepted_matches')
                     break
             if matched is None:
                 track = _LocalTrack(len(tracks), crop.copy(), 0, ratio, kind, index)
@@ -1501,20 +1654,24 @@ def _analyze_local_content(candidates, config):
                                              and np.abs(old.color - crop_color).max() <= 8 for old in active)
                 tracks.append(track)
                 position, confidence = 0, 0.0
+                match_method = 'new_reference'
             else:
-                track, (position, confidence) = matched
+                track, location = matched
+                position, confidence = location
+                match_method = location.method
             track.last_index = index
             track.observations.append({'candidate': candidate, 'top': position, 'bottom': position + len(crop)})
             clipped = 0 if fallback else sum((x <= 1, y <= 1, x + w >= small.shape[1] - 1,
                                               y + h >= small.shape[0] - 1))
-            gray = cv.cvtColor(crop, cv.COLOR_RGB2GRAY)
-            clarity = float(cv.Laplacian(gray, cv.CV_32F).var())
+            clarity = float(cv.Laplacian(crop_gray, cv.CV_32F).var())
             exposures.append(len(crop))
             clipped_edges.append(clipped)
             sharpness.append(clarity)
             motion.append(abs(position))
             regions.append({'track': track.index, 'kind': kind, 'box': [x0, y0, x1 - x0, y1 - y0],
-                            'possible_clipping': bool(clipped), 'match_confidence': round(float(confidence), 4),
+                            'possible_clipping': bool(clipped),
+                            'match_confidence': None if match_method == 'original_position' else round(float(confidence), 4),
+                            'match_method': match_method,
                             'visible_range': [position, position + len(crop)]})
             masked[y:y + h, x:x + w] = background
         signature = cv.resize(masked, (96, 160), interpolation=cv.INTER_AREA)
@@ -1552,6 +1709,7 @@ def _analyze_local_content(candidates, config):
             old.bins = _local_track_bins(old, config)
             old.pixels = None
             old.gray = None
+            old.search_data = None
     for track in tracks:
         bins = _local_track_bins(track, config)
         for number, rows in bins:
