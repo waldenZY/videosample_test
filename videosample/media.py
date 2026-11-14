@@ -32,7 +32,7 @@ from pathlib import Path
 import numpy as np
 
 
-KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4.8"
+KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4.9"
 DEFAULT_TASK_START_TIME = 7.0
 DEFAULT_ANALYSIS_MASK_BOX = (.63, .005, .74, .040)
 
@@ -353,6 +353,7 @@ class KeyframeConfig:
     local_fast_alignment: bool = True
     local_search_reuse: bool = True
     local_match_workers: int = 2
+    local_bounded_search: bool = True
     analysis_mask_box: tuple | None = DEFAULT_ANALYSIS_MASK_BOX
     scroll_dedup_enabled: bool = True
     scroll_analysis_max_edge: int = 800
@@ -396,7 +397,7 @@ class KeyframeConfig:
             raise ValueError("局部分析尺寸或内容分段过小")
         if not 0 < self.local_template_threshold <= 1:
             raise ValueError("局部匹配阈值必须在 0 到 1 之间")
-        for name in ('local_fast_alignment', 'local_search_reuse'):
+        for name in ('local_fast_alignment', 'local_search_reuse', 'local_bounded_search'):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} 必须为布尔值")
         if (isinstance(self.local_match_workers, bool) or not isinstance(self.local_match_workers, Integral)
@@ -1349,6 +1350,123 @@ class _LocalSearchData:
             return self._digest
 
 
+class _LocalBoundedSearch:
+    """横向分块平均只用于保守限制位置；返回前仍在原尺寸搜索。
+
+    中心化图像 a=Pa+Qa、b=Pb+Qb，P 为分块常数投影，则
+    a·b <= Pa·Pb + ||Qa||||Qb||。保留仍可能通过原门槛的位置，
+    低方差、临界分数、重复峰及范围过大时回退。不同页面不依靠小图合并。
+    """
+    def __init__(self, work):
+        self.work = work
+        self.cache = OrderedDict()
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def _prefix(values):
+        return np.concatenate(([0.], np.cumsum(values, dtype=np.float64)))
+
+    def prepare(self, data):
+        key = data.digest()
+        with self.lock:
+            if key in self.cache:
+                self.cache.move_to_end(key)
+                return self.cache[key]
+            width = data.gray.shape[1] - 4
+            edges = np.linspace(0, width, 33, dtype=int)
+            weights = np.sqrt(np.diff(edges))
+            values = data.gray.astype(np.float32)
+            parts = []
+            for x in range(5):
+                crop = values[:, x:x + width]
+                projected = (np.add.reduceat(crop, edges[:-1], axis=1) / weights).astype(np.float32)
+                parts.append((projected, self._prefix(crop.sum(axis=1, dtype=np.float64)),
+                              self._prefix(np.einsum('ij,ij->i', crop, crop, dtype=np.float64)),
+                              self._prefix(np.einsum('ij,ij->i', projected, projected, dtype=np.float64))))
+            result = weights, parts
+            self.cache[key] = result
+            if len(self.cache) > 8:
+                self.cache.popitem(last=False)
+            return result
+
+    def bounds(self, source, target, y, patch):
+        cv = _local_cv()
+        weights, source_parts = self.prepare(source)
+        _, target_parts = self.prepare(target)
+        height, width = patch.shape
+        area = height * width
+        mean = float(patch.mean())
+        variance = float(np.sum((patch.astype(np.float64) - mean) ** 2))
+        if variance <= 1e-8:
+            return None
+        projected = source_parts[2][0][y:y + height].astype(np.float64) - mean * weights
+        residual = max(0., variance - float(np.sum(projected ** 2)))
+        results = []
+        for target_projection, sums, squares, projected_squares in target_parts:
+            total = sums[height:] - sums[:-height]
+            target_variance = squares[height:] - squares[:-height] - total * total / area
+            projected_variance = projected_squares[height:] - projected_squares[:-height] - total * total / area
+            target_residual = np.maximum(0., target_variance - projected_variance)
+            cross = cv.matchTemplate(target_projection, projected.astype(np.float32), cv.TM_CCORR).ravel().astype(np.float64)
+            self.work.add('coarse_projection_calls')
+            denominator = np.sqrt(np.maximum(0., variance * target_variance))
+            upper = np.divide(cross + np.sqrt(residual * target_residual), denominator,
+                              out=np.ones_like(denominator), where=denominator > 1e-8)
+            # 低方差会放大浮点相关计算误差，这些窗口保留为“不确定”。
+            raw_error_guard = area * 65025 * np.finfo(np.float32).eps * 64
+            upper[denominator < raw_error_guard / .01] = 1
+            # 非常数模板与常数窗口在 OpenCV 中得分为 0。
+            upper[target_variance < 1e-8] = 0
+            results.append(upper)
+        return np.column_stack(results)
+
+    def propose(self, source, target, y, patch):
+        self.work.add('coarse_attempts')
+        if (patch.shape[1] < 256 or len(target.gray) - len(patch) < 64
+                or source.gray.dtype != np.uint8 or target.gray.dtype != np.uint8
+                or source.gray.shape[1] != target.gray.shape[1]
+                or patch.shape[1] != source.gray.shape[1] - 4):
+            self.work.add('coarse_small_bypass')
+            return None
+        with self.work.measure('coarse_bound_work_s'):
+            upper = self.bounds(source, target, y, patch)
+        if upper is None or not np.all(np.isfinite(upper)):
+            self.work.add('coarse_uncertain_fallback')
+            return None
+        threshold = self.work.config.local_template_threshold
+        mask = np.any(upper >= threshold - .01, axis=1)
+        if not np.any(mask):
+            self.work.add('coarse_negative_results')
+            return (0., 0, 0)  # 仅表示达不到本次门槛，不伪称已求得原图最大分数。
+        mask[1:] |= mask[:-1].copy()
+        mask[:-1] |= mask[1:].copy()
+        rows = np.flatnonzero(mask)
+        bands = np.split(rows, np.flatnonzero(np.diff(rows) > 1) + 1)
+        if len(rows) > len(mask) * .45 or len(bands) > 6:
+            self.work.add('coarse_broad_fallback')
+            return None
+        peaks = []
+        for band in bands:
+            begin, end = int(band[0]), int(band[-1]) + 1
+            matches, result = self.work.native_match(target.gray[begin:end + len(patch) - 1], patch)
+            score, x, match_y = result
+            peaks.append((score, x, match_y + begin))
+            if matches.size > 1:
+                peaks.append((float(np.partition(matches.ravel(), -2)[-2]), -1, -1))
+            self.work.add('coarse_refine_calls')
+        peaks.sort(key=lambda value: (-value[0], value[2], value[1]))
+        result = peaks[0]
+        if (abs(result[0] - threshold) < .002
+                or (result[0] >= threshold and len(peaks) > 1 and result[0] - peaks[1][0] < .002)):
+            self.work.add('coarse_ambiguous_fallback')
+            return None
+        self.work.add('coarse_refined_results')
+        return result
+
+    def close(self):
+        self.cache.clear()
+
+
 class _LocalWork:
     """仅限一次局部分析的计数、精确搜索缓存和可选线程池。"""
     def __init__(self, config):
@@ -1360,6 +1478,7 @@ class _LocalWork:
         self.frame_counts = None
         self.frame_info = None
         self.slowest_frames = []
+        self.coarse = _LocalBoundedSearch(self) if config.local_bounded_search else None
 
     def add(self, key, value=1):
         with self.lock:
@@ -1406,7 +1525,9 @@ class _LocalWork:
             record = {**self.frame_info, 'elapsed_s': round(elapsed, 4), 'completed': completed,
                       **{key: int(self.frame_counts[key]) for key in (
                           'pair_attempts', 'full_search_attempts', 'template_calls',
-                          'original_position_hits', 'failed_pairs', 'width_mismatches', 'strict_checks')},
+                          'original_position_hits', 'failed_pairs', 'width_mismatches', 'strict_checks',
+                          'coarse_attempts', 'coarse_negative_results', 'coarse_fallbacks',
+                          'template_full_calls', 'coarse_refine_calls')},
                       'position_search_work_s': round(self.frame_counts['position_search_work_s'], 4),
                       'strict_check_work_s': round(self.frame_counts['strict_check_work_s'], 4)}
             self.slowest_frames.append(record)
@@ -1423,7 +1544,6 @@ class _LocalWork:
                     self.frame_info['largest_reference_size'] = size
 
     def peak(self, source, target, y, patch):
-        cv = _local_cv()
         key = (source.digest(), target.digest(), y, patch.shape) if self.config.local_search_reuse else None
         if key is not None:
             with self.lock:
@@ -1431,12 +1551,12 @@ class _LocalWork:
                     self.peaks.move_to_end(key)
                     self.counts['template_cache_hits'] += 1
                     return self.peaks[key]
-        started = time.perf_counter()
-        matches = cv.matchTemplate(target.gray, patch, cv.TM_CCOEFF_NORMED)
-        _, score, _, (x, match_y) = cv.minMaxLoc(matches)
-        self.add('template_search_s', time.perf_counter() - started)
-        self.add('template_calls')
-        result = (score, x, match_y)
+        result = self.coarse.propose(source, target, y, patch) if self.coarse is not None else None
+        if result is None:
+            if self.coarse is not None:
+                self.add('coarse_fallbacks')
+            self.add('template_full_calls')
+            _, result = self.native_match(target.gray, patch)
         if key is not None:
             with self.lock:
                 self.peaks[key] = result
@@ -1444,6 +1564,15 @@ class _LocalWork:
                 if len(self.peaks) > 512:
                     self.peaks.popitem(last=False)
         return result
+
+    def native_match(self, target, patch):
+        cv = _local_cv()
+        started = time.perf_counter()
+        matches = cv.matchTemplate(target, patch, cv.TM_CCOEFF_NORMED)
+        _, score, _, (x, match_y) = cv.minMaxLoc(matches)
+        self.add('template_search_s', time.perf_counter() - started)
+        self.add('template_calls')
+        return matches, (score, x, match_y)
 
     def comparisons(self, tracks, crop, crop_gray, crop_data):
         """原顺序裁决。最近参考先串行，其余小批并行，整批结束才允许改写参考图。"""
@@ -1471,6 +1600,9 @@ class _LocalWork:
         if self.pool is not None:
             self.pool.shutdown(wait=True, cancel_futures=True)
         self.peaks.clear()
+        if self.coarse is not None:
+            self.coarse.close()
+            self.coarse = None
 
 
 class _LocalLocation(tuple):
@@ -1644,10 +1776,20 @@ def _analyze_local_content(candidates, config):
         elapsed = time.perf_counter() - started
         comparison = work.counts['comparison_wall_s']
         background = work.counts['background_strict_wall_s']
+        coarse = {'enabled': config.local_bounded_search,
+                  **{key: int(work.counts[key]) for key in (
+                      'coarse_attempts', 'coarse_negative_results', 'coarse_refined_results',
+                      'coarse_fallbacks', 'coarse_small_bypass', 'coarse_broad_fallback',
+                      'coarse_ambiguous_fallback', 'coarse_uncertain_fallback',
+                      'coarse_refine_calls', 'coarse_projection_calls', 'template_full_calls')},
+                  'bound_work_s': round(work.counts['coarse_bound_work_s'], 4),
+                  'fallback_rate': round(work.counts['coarse_fallbacks'] / work.counts['coarse_attempts'], 4)
+                  if work.counts['coarse_attempts'] else None}
         performance.update(input_frames=len(candidates),
                            elapsed_s=round(elapsed, 4), completed='analysis' in locals(),
                            template_search_work_s=round(work.counts['template_search_s'], 4),
                            match_workers=config.local_match_workers,
+                           coarse_search=coarse,
                            timing_schema='local-cost-v1',
                            timing_breakdown={
                                'comparison_wall_s': round(comparison, 4),
