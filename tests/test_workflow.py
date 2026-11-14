@@ -277,7 +277,7 @@ def test_paired_chains_have_independent_steps(tmp_path, monkeypatch, video, limi
         assert base["algorithm"]["key"] == "base" and other["algorithm"]["key"] == "current"
         assert base["rows"][0]["effective_config"]["max_frames"] == 20
         assert other["rows"][0]["effective_config"]["max_frames"] == limit
-        assert other['rows'][0]['selection']['policy'] == 'adaptive-local-v1'
+        assert other['rows'][0]['selection']['policy'] == 'adaptive-scroll-v1'
         assert other['rows'][0]['selection']['selected_count'] == other['rows'][0]['frame_count']
         trace = client.get(f"/api/runs/{other_id}/items/0/trace").json()
         assert trace['selection'] == other['rows'][0]['selection']

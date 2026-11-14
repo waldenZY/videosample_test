@@ -24,6 +24,10 @@ vm.runInContext(`traceData={stages:[{id:'budget',title:'自适应选图',input_i
 element('showMissingFrames').onclick();assert.equal(element('frameFilter').value,'dropped');
 vm.runInContext(`renderSelection({frame_count:8,selection:{limit:15,representative_count:12,selected_count:8,uncovered_count:0,stop_reason:'covered'}})`,context);
 assert(element('selectionInfo').innerHTML.includes('最终 8 张'));
+vm.runInContext(`renderSelection({selection:{limit:15,representative_count:20,selected_count:14,uncovered_count:0,stop_reason:'covered',scroll_dedup:{enabled:true,checked_frames:17,comparisons:31,merged_frames:3,budget_exhausted:true}}})`,context);
+assert(element('selectionInfo').innerHTML.includes('入选前滑动检查'));
+assert(element('selectionInfo').innerHTML.includes('合并 3 张'));
+assert(element('selectionInfo').innerHTML.includes('未确认重复的候选仍正常参选'));
 vm.runInContext('renderSelection({frame_count:10})',context);assert.equal(element('selectionInfo').hidden,true);
 const value=context.renderDistribution({output_distribution:{samples:2,counts:{'1-5':1,'6-10':0,'11-14':1,'15':0,other:0}},adaptive_selection:{samples:2,hit_limit_count:1,hit_limit_rate:.5,stop_reasons:{covered:1,no_reliable_addition:0,limit_reached:1}}});
 assert(value.includes('50.0%'));assert(value.includes('11-14 张：1 题'));

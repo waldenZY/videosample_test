@@ -19,7 +19,7 @@ import shutil
 import subprocess
 import tempfile
 import time
-from collections import OrderedDict, deque
+from collections import Counter, OrderedDict, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -31,7 +31,7 @@ from pathlib import Path
 import numpy as np
 
 
-KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4.5"
+KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4.6"
 DEFAULT_TASK_START_TIME = 7.0
 DEFAULT_ANALYSIS_MASK_BOX = (.63, .005, .74, .040)
 
@@ -348,6 +348,13 @@ class KeyframeConfig:
     local_template_threshold: float = 0.90
     local_content_bin_height: int = 24
     analysis_mask_box: tuple | None = DEFAULT_ANALYSIS_MASK_BOX
+    scroll_dedup_enabled: bool = True
+    scroll_analysis_max_edge: int = 800
+    scroll_min_width: int = 400
+    scroll_min_height: int = 800
+    scroll_max_related: int = 3
+    scroll_checks_per_candidate: int = 3
+    scroll_agent_indicator_box: tuple | None = (.32, .955, .70, .995)
     # 受保护采样：在开头和结尾两个时间窗口内，每 interval 秒额外标记一帧，
     # 仅当画面高度一致时才去重（用于捕获弹窗/横幅/开场状态等开头结尾的小变化）。
     protected_sample_interval: float = 2.0  # 0 = 禁用；>0 则每 N 秒一帧
@@ -392,6 +399,24 @@ class KeyframeConfig:
                     or not 0 <= box[0] < box[2] <= 1 or not 0 <= box[1] < box[3] <= 1):
                 raise ValueError("分析遮挡区域必须为 0 到 1 的左、上、右、下坐标，或 None")
             object.__setattr__(self, 'analysis_mask_box', tuple(box))
+        if not isinstance(self.scroll_dedup_enabled, bool):
+            raise ValueError("scroll_dedup_enabled 必须为布尔值")
+        for name, value, lower, upper in (
+            ('scroll_analysis_max_edge', self.scroll_analysis_max_edge, 64, 2048),
+            ('scroll_min_width', self.scroll_min_width, 1, 8192),
+            ('scroll_min_height', self.scroll_min_height, 1, 8192),
+            ('scroll_max_related', self.scroll_max_related, 1, 15),
+            ('scroll_checks_per_candidate', self.scroll_checks_per_candidate, 1, 15),
+        ):
+            if isinstance(value, bool) or not isinstance(value, Integral) or not lower <= value <= upper:
+                raise ValueError(f"{name} 必须为 {lower} 到 {upper} 的整数")
+        if self.scroll_agent_indicator_box is not None:
+            box = self.scroll_agent_indicator_box
+            if (not isinstance(box, (tuple, list)) or len(box) != 4
+                    or not all(isinstance(v, Real) and math.isfinite(v) for v in box)
+                    or not 0 <= box[0] < box[2] <= 1 or not 0 <= box[1] < box[3] <= 1):
+                raise ValueError("滑动检查遮挡区域必须为归一化坐标或 None")
+            object.__setattr__(self, 'scroll_agent_indicator_box', tuple(box))
         if self.max_edge <= 0:
             raise ValueError("max_edge 必须大于 0")
         if (
@@ -1565,7 +1590,7 @@ def _analyze_local_content(candidates, config):
     return analysis
 
 
-def _limit_candidates(candidates, limit, *, config=None, analysis=None):
+def _limit_candidates_without_scroll(candidates, limit, *, config=None, analysis=None):
     """按尚未覆盖的内容选图，内容覆盖完即停；上限不是目标张数。"""
     config = config or KeyframeConfig()
     limit = min(15, limit)
@@ -1626,6 +1651,565 @@ def _limit_candidates(candidates, limit, *, config=None, analysis=None):
         else:
             _note(candidate, '未发现可靠新增内容，停止增加图片', common, **details)
     return sorted(selected, key=lambda c: c.time)
+
+
+@dataclass(frozen=True)
+class _ScrollSettings:
+    analysis_edge: int = 800
+    min_width: int = 400
+    min_height: int = 800
+    border_width_fraction: float = 0.025
+    status_height_fraction: float = 0.04
+    bottom_edge_fraction: float = 0.012
+    orb_features: int = 600
+    match_ratio: float = 0.75
+    motion_tolerance: float = 2.0
+    minimum_motion_points: int = 8
+    pixel_difference: int = 28
+    contrast_threshold: int = 20
+    residual_component_limit: int = 12
+    residual_pixel_limit: int = 90
+    local_structure_correlation: float = 0.94
+    analysis_mask_box: tuple = (0.63, 0.005, 0.74, 0.04)
+    agent_indicator_box: tuple = (0.32, 0.955, 0.7, 0.995)
+
+def _scroll_touch_mask(rgb, neighbors):
+    """Only a filled achromatic disc absent in BOTH temporal neighbors, on blank background."""
+    cv = _local_cv()
+    gray = cv.cvtColor(rgb, cv.COLOR_RGB2GRAY)
+    (h, w) = gray.shape
+    bright = ((gray >= 155) & (_scroll_channel_range(rgb) < 14)).astype(np.uint8)
+    (n, labels, stats, centers) = cv.connectedComponentsWithStats(bright, 8)
+    result = np.zeros_like(gray, np.uint8)
+    circles = []
+    for i in range(1, n):
+        (x, y, bw, bh, area) = map(int, stats[i])
+        (cx, cy) = centers[i]
+        if not (40 <= area <= 1800 and 0.8 <= bw / max(1, bh) <= 1.25 and (area / (bw * bh) > 0.62)):
+            continue
+        radius = max(bw, bh) / 2
+        if not 4 <= radius <= 25:
+            continue
+        if x < round(0.04 * w) or x + bw > round(0.96 * w) or y < round(0.1 * h) or (y + bh > round(0.9 * h)):
+            continue
+        margin = round(radius * 0.9) + 4
+        (ax0, ay0) = (max(0, x - margin), max(0, y - margin))
+        (ax1, ay1) = (min(w, x + bw + margin), min(h, y + bh + margin))
+        (yy, xx) = np.mgrid[ay0:ay1, ax0:ax1]
+        disk = (xx - cx) ** 2 + (yy - cy) ** 2 <= (radius + 2) ** 2
+        ring = (xx - cx) ** 2 + (yy - cy) ** 2 >= (radius + 3) ** 2
+        patch = gray[ay0:ay1, ax0:ax1]
+        if patch[ring].std() > 12 or patch[disk].mean() - patch[ring].mean() < 65:
+            continue
+        absent = []
+        for other in neighbors:
+            og = cv.cvtColor(other[ay0:ay1, ax0:ax1], cv.COLOR_RGB2GRAY)
+            absent.append(float(og[disk].mean() - og[ring].mean()) < 25 and float(og.std()) < 16)
+        if len(absent) != 2 or not all(absent):
+            continue
+        result[ay0:ay1, ax0:ax1][disk] = 255
+        circles.append({'center': [round(float(cx), 1), round(float(cy), 1)], 'radius': round(radius, 1)})
+    return (result, circles)
+
+def _scroll_motions(a, b):
+    cv = _local_cv()
+    c = a.config
+    if a.descriptors is None or b.descriptors is None:
+        return ([], 0)
+    pairs = cv.BFMatcher(cv.NORM_HAMMING).knnMatch(a.descriptors, b.descriptors, k=2)
+    matches = [p[0] for p in pairs if len(p) == 2 and p[0].distance < c.match_ratio * p[1].distance]
+    if not matches:
+        return ([], 0)
+    aa = np.float32([a.points[m.queryIdx].pt for m in matches])
+    bb = np.float32([b.points[m.trainIdx].pt for m in matches])
+    delta = bb - aa
+    remaining = np.ones(len(delta), bool)
+    models = []
+    for _ in range(3):
+        if remaining.sum() < c.minimum_motion_points:
+            break
+        options = np.flatnonzero(remaining)
+        support = np.max(np.abs(delta[options, None, :] - delta[None, :, :]), axis=2) <= c.motion_tolerance
+        chosen = options[int(np.argmax(support.sum(axis=1)))]
+        members = np.max(np.abs(delta - delta[chosen]), axis=1) <= c.motion_tolerance
+        shift = np.median(delta[members], axis=0)
+        members = np.max(np.abs(delta - shift), axis=1) <= c.motion_tolerance
+        remaining[members] = False
+        if members.sum() < c.minimum_motion_points:
+            continue
+        span = np.ptp(aa[members], axis=0)
+        if span.max() < 35:
+            continue
+        (dx, dy) = np.rint(shift / a.scale).astype(int)
+        if max(abs(dx), abs(dy)) <= 3:
+            continue
+        if min(abs(dx), abs(dy)) > max(abs(dx), abs(dy)) * 0.15:
+            continue
+        models.append({'shift': [int(dx), int(dy)], 'points': int(members.sum()), 'span': span.tolist()})
+    return (models, len(matches))
+
+def _scroll_channel_range(rgb):
+    cv = _local_cv()
+    (r, g, b) = cv.split(rgb)
+    return cv.subtract(cv.max(cv.max(r, g), b), cv.min(cv.min(r, g), b))
+
+class _ScrollView:
+
+    def __init__(self, engine, fid):
+        cv = _local_cv()
+        self.engine = engine
+        self.fid = fid
+        self.config = engine.config
+        rgb = engine.raw(fid).copy()
+        (h, w) = rgb.shape[:2]
+        for box in [self.config.analysis_mask_box, self.config.agent_indicator_box]:
+            if box is None:
+                continue
+            rgb[round(box[1] * h):round(box[3] * h), round(box[0] * w):round(box[2] * w)] = 0
+        self.rgb = cv.GaussianBlur(rgb, (3, 3), 0.55)
+        self.gray = cv.cvtColor(self.rgb, cv.COLOR_RGB2GRAY)
+        self.scale = min(1.0, self.config.analysis_edge / max(h, w))
+
+    def bounds(self):
+        (h, w) = self.gray.shape
+        c = self.config
+        return (round(c.border_width_fraction * w), round(c.status_height_fraction * h), round(w * (1 - c.border_width_fraction)), round(h * (1 - c.bottom_edge_fraction)))
+
+    def quality(self):
+        if self.fid not in self.engine.qualities:
+            (x0, y0, x1, y1) = self.bounds()
+            self.engine.qualities[self.fid] = int(self.foreground[y0:y1, x0:x1].sum())
+        return self.engine.qualities[self.fid]
+
+    def __getattr__(self, key):
+        cv = _local_cv()
+        if key == 'foreground':
+            self.engine.counts['foreground_build'] += 1
+            value = cv.absdiff(self.gray, cv.GaussianBlur(self.gray, (0, 0), 2)) >= self.config.contrast_threshold
+        elif key == 'lower':
+            self.engine.counts['range_build'] += 1
+            value = cv.erode(self.rgb, np.ones((3, 3), np.uint8))
+        elif key == 'upper':
+            self.engine.counts['range_build'] += 1
+            value = cv.dilate(self.rgb, np.ones((3, 3), np.uint8))
+        elif key == 'touch_mask':
+            value = self.engine.touch(self.fid)
+        elif key in ('points', 'descriptors'):
+            if self.fid not in self.engine.features:
+                small = cv.resize(self.gray, None, fx=self.scale, fy=self.scale, interpolation=cv.INTER_AREA)
+                valid = np.zeros_like(small)
+                (x0, y0, x1, y1) = self.bounds()
+                valid[round(y0 * self.scale):round(y1 * self.scale), round(x0 * self.scale):round(x1 * self.scale)] = 255
+                value = cv.ORB_create(nfeatures=self.config.orb_features, fastThreshold=12).detectAndCompute(small, valid)
+                self.engine.features[self.fid] = value
+                self.engine.counts['feature_build'] += 1
+                if len(self.engine.features) > 64:
+                    self.engine.features.popitem(last=False)
+            self.engine.features.move_to_end(self.fid)
+            (self.points, self.descriptors) = self.engine.features[self.fid]
+            return getattr(self, key)
+        else:
+            raise AttributeError(key)
+        setattr(self, key, value)
+        return value
+
+class _ScrollEngine:
+
+    def __init__(self, frames, root, view_capacity=4, raw_capacity=6, config=None):
+        self.frames = frames
+        self.root = root
+        self.config = config if config is not None else _ScrollSettings()
+        self.lookup = {f['id']: f for f in frames}
+        self.indices = {f['id']: i for (i, f) in enumerate(frames)}
+        self.raw_cache = OrderedDict()
+        self.views = OrderedDict()
+        self.features = OrderedDict()
+        self.touches = OrderedDict()
+        self.qualities = {}
+        self.pairs = {}
+        self.counts = Counter()
+        self.logs = []
+        self.view_capacity = view_capacity
+        self.raw_capacity = raw_capacity
+
+    def raw(self, fid):
+        from PIL import Image
+        if fid not in self.raw_cache:
+            with Image.open(self.root / self.lookup[fid]['image']) as im:
+                self.raw_cache[fid] = np.array(im.convert('RGB'))
+            self.counts['decode'] += 1
+            if len(self.raw_cache) > self.raw_capacity:
+                self.raw_cache.popitem(last=False)
+        self.raw_cache.move_to_end(fid)
+        return self.raw_cache[fid]
+
+    def touch(self, fid):
+        if fid not in self.touches:
+            i = self.indices[fid]
+            neighbors = [self.raw(self.frames[j]['id']) for j in [i - 1, i + 1] if 0 <= j < len(self.frames)]
+            (mask, _) = _scroll_touch_mask(self.raw(fid), neighbors)
+            self.touches[fid] = np.packbits(mask.ravel() > 0)
+            self.counts['touch_build'] += 1
+            if len(self.touches) > 64:
+                self.touches.popitem(last=False)
+        self.touches.move_to_end(fid)
+        (h, w) = self.raw(fid).shape[:2]
+        return np.unpackbits(self.touches[fid], count=h * w).reshape(h, w) * np.uint8(255)
+
+    def view(self, fid):
+        if fid not in self.views:
+            self.views[fid] = _ScrollView(self, fid)
+            self.counts['view_build'] += 1
+            if len(self.views) > self.view_capacity:
+                self.views.popitem(last=False)
+        self.views.move_to_end(fid)
+        return self.views[fid]
+
+    def compare(self, a, b):
+        key = (a, b)
+        self.counts['compare_requests'] += 1
+        if key not in self.pairs:
+            self.counts['judge'] += 1
+            self.pairs[key] = {'a': a, 'b': b, **_scroll_judge(self.view(a), self.view(b))}
+            self.logs.append(self.pairs[key])
+            arrays = []
+            arrays.extend(self.raw_cache.values())
+            arrays.extend(self.touches.values())
+            arrays.extend((v for view in self.views.values() for v in view.__dict__.values() if isinstance(v, np.ndarray)))
+            arrays.extend((value[1] for value in self.features.values() if value[1] is not None))
+            unique = {id(a): a for a in arrays}
+            self.counts['max_cached_array_bytes'] = max(self.counts['max_cached_array_bytes'], sum((a.nbytes for a in unique.values())))
+        return self.pairs[key]
+
+
+    def close(self):
+        self.views.clear()
+        self.raw_cache.clear()
+        self.features.clear()
+        self.touches.clear()
+        self.qualities.clear()
+        self.pairs.clear()
+        self.logs.clear()
+
+def _scroll_judge(a, b):
+    cv = _local_cv()
+    if a.rgb.shape != b.rgb.shape:
+        return {'decision': 'keep', 'reason': '尺寸变化'}
+    # Native-pixel tolerances were validated on phone recordings. Do not
+    # erase small controls when a lower-resolution input has thinner strokes.
+    height, width = a.rgb.shape[:2]
+    if width < a.config.min_width or height < a.config.min_height:
+        return {'decision': 'uncertain', 'reason': '候选图尺寸较小，未确认滑动重复'}
+    c = a.config
+    (x0, y0, x1, y1) = a.bounds()
+    (h, w) = a.gray.shape
+    (motion_models, match_count) = _scroll_motions(a, b)
+    if match_count < 8:
+        return {'decision': 'uncertain', 'reason': '缺少可靠的共同图案', 'feature_matches': match_count, 'terminated_before_native': True}
+    moving = sorted(motion_models, key=lambda m: -m['points'])[:1]
+    shifts = [(0, 0)] + [tuple(m['shift']) for m in moving]
+    error = np.full((h, w), 255, np.uint8)
+    foreground = np.zeros((h, w), bool)
+    for (dx, dy) in shifts:
+        (ax0, ax1) = (max(x0, x0 - dx), min(x1, x1 - dx))
+        (ay0, ay1) = (max(y0, y0 - dy), min(y1, y1 - dy))
+        if ax1 <= ax0 or ay1 <= ay0:
+            continue
+        sa = np.s_[ay0:ay1, ax0:ax1]
+        sb = np.s_[ay0 + dy:ay1 + dy, ax0 + dx:ax1 + dx]
+        ar = a.rgb[sa]
+        br = b.rgb[sb]
+        delta = cv.max(cv.max(cv.subtract(a.lower[sa], br), cv.subtract(br, a.upper[sa])), cv.max(cv.subtract(b.lower[sb], ar), cv.subtract(ar, b.upper[sb])))
+        channels = cv.split(delta)
+        delta = cv.max(cv.max(channels[0], channels[1]), channels[2])
+        delta[(a.touch_mask[sa] > 0) | (b.touch_mask[sb] > 0)] = 0
+        error[sa] = np.minimum(error[sa], delta)
+        foreground[sa] |= a.foreground[sa] | b.foreground[sb]
+    valid = np.zeros((h, w), bool)
+    valid[y0:y1, x0:x1] = True
+    if moving:
+        (dx, dy) = moving[0]['shift']
+        if dy > 0:
+            valid[max(y0, y1 - dy):y1] = False
+        elif dy < 0:
+            valid[y0:min(y1, y0 - dy)] = False
+        if dx > 0:
+            valid[:, max(x0, x1 - dx):x1] = False
+        elif dx < 0:
+            valid[:, x0:min(x1, x0 - dx)] = False
+    changed = ((error >= c.pixel_difference) & foreground & valid).astype(np.uint8)
+    (n, labels, stats, _) = cv.connectedComponentsWithStats(changed, 8)
+    initial_pixels = int(changed.sum())
+    explained_components = 0
+    for i in sorted(range(1, n), key=lambda i: -stats[i, 4]):
+        (x, y, bw, bh, area) = map(int, stats[i])
+        if area < 3 or bw > 160 or bh > 100:
+            if area >= c.residual_component_limit:
+                return _scroll_early_failure(match_count, moving, area)
+            continue
+        (ax0, ay0) = (max(x0, x - 5), max(y0, y - 5))
+        (ax1, ay1) = (min(x1, x + bw + 5), min(y1, y + bh + 5))
+        patch = a.gray[ay0:ay1, ax0:ax1]
+        if patch.size < 25 or patch.std() < 8:
+            if area >= c.residual_component_limit:
+                return _scroll_early_failure(match_count, moving, area)
+            continue
+        explained = False
+        for (dx, dy) in shifts:
+            (bx0, by0, bx1, by1) = (ax0 + dx, ay0 + dy, ax1 + dx, ay1 + dy)
+            if bx0 < 0 or by0 < 0 or bx1 > w or (by1 > h):
+                continue
+            search = b.gray[max(0, by0 - 2):min(h, by1 + 2), max(0, bx0 - 2):min(w, bx1 + 2)]
+            if search.shape[0] < patch.shape[0] or search.shape[1] < patch.shape[1]:
+                continue
+            (_, score, _, loc) = cv.minMaxLoc(cv.matchTemplate(search, patch, cv.TM_CCOEFF_NORMED))
+            if score < c.local_structure_correlation:
+                continue
+            xx = max(0, bx0 - 2) + loc[0]
+            yy = max(0, by0 - 2) + loc[1]
+            other = b.rgb[yy:yy + patch.shape[0], xx:xx + patch.shape[1]]
+            original = a.rgb[ay0:ay1, ax0:ax1]
+            if np.max(np.abs(original.mean(axis=(0, 1)) - other.mean(axis=(0, 1)))) > 18:
+                continue
+            explained = True
+            break
+        if explained:
+            region = changed[y:y + bh, x:x + bw]
+            region[labels[y:y + bh, x:x + bw] == i] = 0
+            explained_components += 1
+        if not explained and area >= c.residual_component_limit:
+            return _scroll_early_failure(match_count, moving, area)
+    (n, _, stats, _) = cv.connectedComponentsWithStats(changed, 8)
+    largest = int(stats[1:n, cv.CC_STAT_AREA].max()) if n > 1 else 0
+    pixels = int(changed.sum())
+    detail = {'motion_models': moving, 'feature_matches': match_count, 'residual_pixels': pixels, 'largest_residual': largest, 'foreground_a': a.quality(), 'foreground_b': b.quality(), 'raw_residual_pixels': initial_pixels, 'structure_matched_components': explained_components, 'largest_boxes': [list(map(int, s)) for s in sorted(stats[1:], key=lambda s: -s[4])[:5]]}
+    if match_count < 8:
+        return {**detail, 'decision': 'uncertain', 'reason': '缺少可靠的共同图案'}
+    if largest >= c.residual_component_limit or pixels > c.residual_pixel_limit:
+        return {**detail, 'decision': 'keep', 'reason': '对齐后仍有前景变化'}
+    return {**detail, 'decision': 'merge', 'reason': '主要图案对应，剩余变化低于试验门槛', 'representative': 'b' if b.quality() > a.quality() else 'a'}
+
+def _scroll_early_failure(match_count, moving, area):
+    return {'decision': 'keep' if match_count >= 8 else 'uncertain', 'reason': '对齐后仍有前景变化' if match_count >= 8 else '缺少可靠的共同图案', 'motion_models': moving, 'feature_matches': match_count, 'certified_residual_lower_bound': int(area), 'terminated_early': True}
+
+def _choose_with_scroll(candidates, analysis, anchors, frame_ids, compare=None, *, limit=15, max_related=3, max_checks=None, routing='mixed'):
+    limit = min(15, limit)
+    order = {id(c): i for (i, c) in enumerate(candidates)}
+    lookup = {id(c): c for c in candidates}
+    selected = list(anchors[:limit])
+    protected = {id(c) for c in selected}
+    groups = {id(c): [id(c)] for c in selected}
+    coverage = {key: set(value) for (key, value) in analysis.coverage.items()}
+    weights = {key: unit['weight'] for (key, unit) in analysis.units.items()}
+    blocked = set()
+    events = []
+    checks = 0
+    replacement_checks = 0
+    visited = 0
+    max_checks = 3 * len(candidates) if max_checks is None else max_checks
+
+    def total(keys):
+        return round(math.fsum((weights[k] for k in sorted(keys))), 12)
+
+    def covered():
+        return set().union(*(coverage[id(c)] for c in selected)) if selected else set()
+
+    def related(candidate, rep):
+        (ca, cb) = (coverage[id(candidate)], coverage[id(rep)])
+        shared = total((k for k in ca & cb if analysis.units[k]['kind'] != 'background'))
+        distance = float(np.mean((analysis.descriptors[id(candidate)] - analysis.descriptors[id(rep)]) ** 2))
+        return (shared, distance)
+
+    def _scroll_judge(rep, candidate):
+        nonlocal checks
+        if checks >= max_checks:
+            return None
+        checks += 1
+        return compare(frame_ids[id(rep)], frame_ids[id(candidate)])
+    while len(selected) < limit:
+        present = {id(c) for c in selected}
+        seen = covered()
+        remaining = [c for c in analysis.representatives if id(c) not in present | blocked]
+        useful = [c for c in remaining if total(coverage[id(c)] - seen) > 1e-09]
+        if not useful:
+            break
+
+        def rank(candidate):
+            ident = id(candidate)
+            novelty = min((float(np.mean((analysis.descriptors[ident] - analysis.descriptors[id(c)]) ** 2)) for c in selected), default=1.0)
+            return (total(coverage[ident] - seen), *analysis.quality[ident], novelty, candidate.support_s, candidate.time, order[ident])
+        candidate = max(useful, key=rank)
+        cid = id(candidate)
+        visited += 1
+        event = {'candidate': frame_ids[cid], 'gain_before_check': total(coverage[cid] - seen), 'checks': []}
+        matched = False
+        if compare is not None and checks < max_checks:
+            possible = []
+            for rep in selected:
+                (shared, distance) = related(candidate, rep)
+                if shared > 0 or distance <= 0.04:
+                    possible.append((rep, shared, distance))
+            possible.sort(key=lambda item: (-item[1], item[2], abs(item[0].time - candidate.time), order[id(item[0])]))
+            if routing == 'mixed':
+                before = sorted((p for p in possible if p[0].time <= candidate.time), key=lambda p: (candidate.time - p[0].time, order[id(p[0])]))
+                after = sorted((p for p in possible if p[0].time > candidate.time), key=lambda p: (p[0].time - candidate.time, order[id(p[0])]))
+                priority = before[:1] + after[:1] + possible
+                unique = []
+                used = set()
+                for p in priority:
+                    if id(p[0]) not in used:
+                        used.add(id(p[0]))
+                        unique.append(p)
+                possible = unique
+            for (rep, shared, distance) in possible[:max_related]:
+                result = _scroll_judge(rep, candidate)
+                if result is None:
+                    break
+                rid = id(rep)
+                event['checks'].append({'representative': frame_ids[rid], 'decision': result['decision']})
+                if result['decision'] != 'merge':
+                    continue
+                winner = cid if result['representative'] == 'b' else rid
+                if winner == cid and rid in protected:
+                    event.setdefault('notes', []).append('首尾代表不可替换，保留本候选的参选机会')
+                    continue
+                if winner == cid:
+                    verified = True
+                    for member in groups[rid]:
+                        if member == rid:
+                            continue
+                        check = _scroll_judge(lookup[member], candidate)
+                        replacement_checks += int(check is not None)
+                        if check is None or check['decision'] != 'merge':
+                            verified = False
+                            break
+                    if not verified:
+                        event.setdefault('notes', []).append('未完成直接替换核验，保留本候选的参选机会')
+                        continue
+                    selected[selected.index(rep)] = candidate
+                    groups[cid] = groups.pop(rid) + [cid]
+                    blocked.add(rid)
+                    coverage[cid] |= coverage[rid]
+                    event.update({'action': 'replace', 'previous': frame_ids[rid], 'representative': frame_ids[cid]})
+                else:
+                    blocked.add(cid)
+                    groups[rid].append(cid)
+                    coverage[rid] |= coverage[cid]
+                    event.update({'action': 'merge', 'representative': frame_ids[rid]})
+                matched = True
+                break
+        if not matched:
+            selected.append(candidate)
+            groups[cid] = [cid]
+            event['action'] = 'select'
+            if compare is not None and checks >= max_checks:
+                event.setdefault('notes', []).append('检查预算用完，按原选图规则保留，未确认重复不删除')
+        events.append(event)
+    selected.sort(key=lambda c: (c.time, order[id(c)]))
+    all_eligible = set().union(*(analysis.coverage[id(c)] for c in analysis.representatives))
+    missing = {k for k in all_eligible - covered() if weights[k] > 0}
+    reason = 'limit_reached' if len(selected) >= limit and missing else 'recorded_units_covered' if not missing else 'no_reliable_addition'
+    result = {'selected_ids': [frame_ids[id(c)] for c in selected], 'selected_count': len(selected), 'visited_candidates': visited, 'checks': checks, 'replacement_checks': replacement_checks, 'check_budget': max_checks, 'budget_exhausted': checks >= max_checks, 'stop_reason': reason, 'uncovered_units': len(missing), 'events': events, 'groups': [{'representative': frame_ids[id(c)], 'members': [frame_ids[m] for m in groups[id(c)]]} for c in selected]}
+    assert len(selected) <= limit and len(events) <= len(candidates)
+    return result
+
+def _limit_candidates(candidates, limit, *, config=None, analysis=None):
+    """Allocate a slot only after the previous, lightweight scroll check."""
+    config = config or KeyframeConfig()
+    if not config.scroll_dedup_enabled:
+        return _limit_candidates_without_scroll(candidates, limit, config=config, analysis=analysis)
+    analysis = analysis or _analyze_local_content(candidates, config)
+    pool = list(analysis.candidates)
+    recorder = _PROCESS.get()
+    frame_ids = {id(c): recorder.identify(c) if recorder is not None else f'c{i:05d}'
+                 for i, c in enumerate(pool)}
+    lookup = {frame_ids[id(c)]: c for c in pool}
+    frames = [{'id': frame_ids[id(c)], 'image': c.path} for c in pool]
+    settings = _ScrollSettings(analysis_edge=config.scroll_analysis_max_edge,
+                               min_width=config.scroll_min_width, min_height=config.scroll_min_height,
+                               analysis_mask_box=config.analysis_mask_box,
+                               agent_indicator_box=config.scroll_agent_indicator_box)
+    engine = _ScrollEngine(frames, Path(), view_capacity=16, raw_capacity=48, config=settings)
+    try:
+        result = _choose_with_scroll(pool, analysis, _selection_anchors(list(candidates), limit),
+                                     frame_ids, engine.compare, limit=limit,
+                                     max_related=config.scroll_max_related,
+                                     max_checks=config.scroll_checks_per_candidate * len(pool))
+        comparisons = list(engine.logs)
+        counters = dict(engine.counts)
+    finally:
+        engine.close()
+    selected = [lookup[fid] for fid in result['selected_ids']]
+    eligible = set().union(*(analysis.coverage[id(c)] for c in analysis.representatives))
+    required = {key for key in eligible if analysis.units[key]['weight'] > 0}
+    representatives = {}
+    for group in result['groups']:
+        rep = lookup[group['representative']]
+        analysis.coverage[id(rep)] = set().union(*(analysis.coverage[id(lookup[fid])]
+                                                   for fid in group['members']))
+        for fid in group['members']:
+            representatives[fid] = rep
+            if lookup[fid] is not rep:
+                analysis.replacements[id(lookup[fid])] = rep
+    covered = set().union(*(analysis.coverage[id(c)] for c in selected)) if selected else set()
+    uncovered = required - covered
+    uncertain = {key for key in eligible if analysis.units[key]['weight'] == 0} - covered
+    hit = bool(uncovered) and len(selected) >= min(limit, 15)
+    reason = 'limit_reached' if hit else 'covered' if not uncovered and not uncertain else 'no_reliable_addition'
+    merged_count = sum(len(group['members']) - 1 for group in result['groups'])
+    checked = {r[key] for r in comparisons for key in ('a', 'b')}
+    analysis.summary = {
+        'policy': 'adaptive-scroll-v1', 'limit': min(limit, 15), 'stop_reason': reason, 'hit_limit': hit,
+        'input_count': len(pool), 'representative_count': len(analysis.representatives),
+        'identified_content_count': len(required), 'covered_content_count': len(required & covered),
+        'uncovered_count': len(uncovered), 'uncertain_content_count': len(uncertain),
+        'uncovered_content': [analysis.units[key] for key in sorted(uncovered)], 'selected_count': len(selected),
+        'scroll_dedup': {'enabled': True, 'checked_frames': len(checked),
+                         'comparisons': counters.get('judge', 0), 'merged_frames': merged_count,
+                         'representative_changes': sum(e['action'] == 'replace' for e in result['events']),
+                         'check_budget': result['check_budget'], 'budget_exhausted': result['budget_exhausted'],
+                         'cache_counts': counters},
+    }
+    events = {e['candidate']: e for e in result['events']}
+    per_frame = {fid: [] for fid in lookup}
+    for comparison in comparisons:
+        per_frame[comparison['a']].append(comparison)
+        per_frame[comparison['b']].append(comparison)
+    selected_ids = {id(c) for c in selected}
+    anchor_ids = {id(c) for c in _selection_anchors(list(candidates), limit)}
+    for candidate in candidates:
+        fid, identity = frame_ids[id(candidate)], id(candidate)
+        candidate.evidence_ids = tuple(sorted(analysis.coverage[identity]))
+        missing = analysis.coverage[identity] - covered
+        event = events.get(fid)
+        details = {'frame_limit': min(limit, 15), 'coverage_ids': list(candidate.evidence_ids),
+                   'uncovered_ids': sorted(missing), 'stop_reason': reason,
+                   'scroll_checked': fid in checked, 'scroll_comparisons': per_frame[fid]}
+        if event:
+            details['selection_attempt'] = event
+        representative = representatives.get(fid)
+        if identity in selected_ids:
+            label = '保留任务首帧或结束位置' if identity in anchor_ids else '覆盖尚未展示的内容；入选前未确认滑动重复'
+            if event and event['action'] == 'replace':
+                label = '入选前确认重复，改用本帧作为代表并继续选图'
+            _note(candidate, label, **details)
+        elif representative is not None and representative is not candidate:
+            _note(candidate, '入选前确认滑动或静止重复，由代表图覆盖，不占新名额', [representative], **details)
+        elif identity in analysis.replacements:
+            rep = analysis.replacements[identity]
+            rep = representatives.get(frame_ids[id(rep)], rep)
+            _note(candidate, '同一内容已有代表图', [rep], **details)
+        elif not missing:
+            _note(candidate, '识别到的内容已被覆盖，不补图凑数', **details)
+        elif hit:
+            _note(candidate, f'达到 {min(limit, 15)} 张上限，此帧仍有内容未覆盖', selected[-1:],
+                  last_selected_comparison={'new_content_weight': result['events'][-1]['gain_before_check']}
+                  if result['events'] else {},
+                  new_content_weight=round(math.fsum(analysis.units[key]['weight'] for key in sorted(missing)), 6),
+                  **details)
+        else:
+            _note(candidate, '未发现可靠新增内容，停止增加图片', **details)
+    return selected
 
 
 @_with_feature_cache

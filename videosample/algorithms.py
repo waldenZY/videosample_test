@@ -30,7 +30,7 @@ def snapshot(key, *, max_frames=None):
     if key == "current" and max_frames is not None:
         result["overrides"] = {"max_frames": max_frames}
     if key == "current":
-        result['selection_policy'] = 'adaptive-local-v1'
+        result['selection_policy'] = 'adaptive-scroll-v1'
     return result
 
 

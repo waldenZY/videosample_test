@@ -119,7 +119,7 @@ def test_local_analysis_reads_each_candidate_once(tmp_path, monkeypatch):
         return original(*args)
 
     monkeypatch.setattr(Image, "open", counted)
-    selected = media._limit_candidates(candidates, 10)
+    selected = media._limit_candidates(candidates, 10, config=media.KeyframeConfig(scroll_dedup_enabled=False))
     assert len(selected) == 10
     assert len(calls) == len(candidates)
 

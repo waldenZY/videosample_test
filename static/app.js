@@ -74,7 +74,9 @@ const selectionLabels={covered:'已识别的内容已覆盖',no_reliable_additio
 function renderSelection(row){
  const selection=row?.selection, panel=$('selectionInfo');panel.hidden=!selection;
  if(!selection){panel.textContent='';return;}
- panel.innerHTML=`<strong>${esc(selectionLabels[selection.stop_reason]||selection.stop_reason)}</strong><p>上限 ${esc(selection.limit)} 张 · 代表候选 ${esc(selection.representative_count)} 张 · 最终 ${esc(selection.selected_count??selection.selected_after_dedup??row.frame_count??'—')} 张 · 未覆盖 ${esc(selection.uncovered_count)} 个图像内容片段</p><div class="small muted">片段按图像区域计算，不等同于业务操作数；局部与裁切线索不代表已经确认卡片完整。</div>${selection.uncovered_count?'<button id="showMissingFrames">查看数量分配中未选的图片</button>':''}`;
+ const scroll=selection.scroll_dedup;
+ const scrollInfo=scroll?.enabled?`<p class="small muted">入选前滑动检查：涉及 ${esc(scroll.checked_frames)} 张 · 比较 ${esc(scroll.comparisons)} 次 · 合并 ${esc(scroll.merged_frames)} 张${scroll.budget_exhausted?' · 检查预算已用完，未确认重复的候选仍正常参选':''}</p>`:'';
+ panel.innerHTML=`<strong>${esc(selectionLabels[selection.stop_reason]||selection.stop_reason)}</strong><p>上限 ${esc(selection.limit)} 张 · 代表候选 ${esc(selection.representative_count)} 张 · 最终 ${esc(selection.selected_count??selection.selected_after_dedup??row.frame_count??'—')} 张 · 未覆盖 ${esc(selection.uncovered_count)} 个图像内容片段</p>${scrollInfo}<div class="small muted">片段按图像区域计算，不等同于业务操作数；局部与裁切线索不代表已经确认卡片完整。</div>${selection.uncovered_count?'<button id="showMissingFrames">查看数量分配中未选的图片</button>':''}`;
  const button=$('showMissingFrames');if(button)button.onclick=()=>{if(!traceData)return;stageId='budget';$('frameFilter').value='dropped';renderStages();renderGallery();};
 }
 function renderDistribution(stats){
