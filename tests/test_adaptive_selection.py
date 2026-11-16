@@ -35,9 +35,9 @@ def shot(tmp_path, name, time, content=None, y=110, color='#b8c2cc', end=False):
                             support_s=.25, keep_reason='task-end-explicit' if end else '')
 
 
-def select(candidates, limit=15):
+def select(candidates, limit=15, scoring=None):
     # 这些纯画布没有录屏状态栏，卡片可以滑到任意边缘；不套用固定布局遮挡。
-    config = media.KeyframeConfig(analysis_mask_box=None)
+    config = media.KeyframeConfig(analysis_mask_box=None, **({'selection_scoring':scoring} if scoring else {}))
     analysis = media._analyze_local_content(candidates, config)
     selected = media._limit_candidates(candidates, limit, config=config, analysis=analysis)
     return selected, analysis
@@ -149,7 +149,8 @@ def test_global_page_diversity_cannot_exclude_local_popup(tmp_path):
         candidate.page_id = i + 1
     popup = shot(tmp_path, 'popup', 10, panel('SAVED'))
     end = shot(tmp_path, 'end', 11, end=True)
-    selected, _ = select([start, *pages, popup, end], limit=10)
+    # 此项覆盖原权重策略的页面多样性规则；比例策略不再给局部组额外权重。
+    selected, _ = select([start, *pages, popup, end], limit=10, scoring='content_weight')
     assert popup in selected
 
 

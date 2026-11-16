@@ -106,6 +106,6 @@ def test_recording_competitions_does_not_change_decisions_or_comparisons(tmp_pat
     assert not first['last_competitions'] and second['last_competitions']
 
 
-def test_configuration_defaults_to_existing_score_and_rejects_invalid_method():
-    assert media.KeyframeConfig().selection_scoring=='content_weight'
+def test_configuration_defaults_to_accepted_ratio_and_rejects_invalid_method():
+    assert media.KeyframeConfig().selection_scoring=='new_content_ratio'
     with pytest.raises(ValueError):media.KeyframeConfig(selection_scoring='invalid')

@@ -32,7 +32,7 @@ from pathlib import Path
 import numpy as np
 
 
-KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4.11"
+KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4.12"
 DEFAULT_TASK_START_TIME = 7.0
 DEFAULT_ANALYSIS_MASK_BOX = (.63, .005, .74, .040)
 
@@ -355,7 +355,7 @@ class KeyframeConfig:
     local_match_workers: int = 2
     local_bounded_search: bool = True
     local_reference_prefilter: bool = True
-    selection_scoring: str = 'content_weight'
+    selection_scoring: str = 'new_content_ratio'
     analysis_mask_box: tuple | None = DEFAULT_ANALYSIS_MASK_BOX
     scroll_dedup_enabled: bool = True
     scroll_analysis_max_edge: int = 800
@@ -2847,7 +2847,7 @@ def extract_scene_keyframes(
             scene_threshold=threshold,
             scene_min_gap_s=min_gap_s,
             max_edge=max_edge,
-            selection_scoring=selection_scoring if selection_scoring is not None else 'content_weight',
+            selection_scoring=selection_scoring if selection_scoring is not None else 'new_content_ratio',
         )
     elif (
         task_start_time != DEFAULT_TASK_START_TIME

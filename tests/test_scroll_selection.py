@@ -30,7 +30,7 @@ def test_duplicate_frees_slot_and_records_actual_representative(tmp_path,monkeyp
         return result
     monkeypatch.setattr(media._ScrollEngine,'compare',compare)
     # Start anchor plus content 1; duplicate 2 must give way to content 3.
-    selected=media._limit_candidates(candidates,3,analysis=analysis)
+    selected=media._limit_candidates(candidates,3,analysis=analysis,config=media.KeyframeConfig(selection_scoring='content_weight'))
     assert selected==[candidates[0],candidates[1],candidates[3]]
     assert analysis.replacements[id(candidates[2])] is candidates[1]
     assert analysis.coverage[id(candidates[1])]=={'1','2'}
@@ -55,7 +55,7 @@ def test_unchecked_at_limit_has_truthful_trace(tmp_path,monkeypatch):
     monkeypatch.setattr(media._ScrollEngine,'compare',lambda self,a,b:{'decision':'keep'})
     with media.record_process(tmp_path/'process') as recorder:
         media._stage('content','content',[],candidates)
-        selected=media._limit_candidates(candidates,2,analysis=analysis)
+        selected=media._limit_candidates(candidates,2,analysis=analysis,config=media.KeyframeConfig(selection_scoring='content_weight'))
         media._stage('budget','budget',candidates,selected)
     dropped=next(f for f in recorder.frames if f['time']==3)['history'][-1]
     assert dropped['status']=='dropped' and '上限' in dropped['reason']

@@ -64,17 +64,35 @@ def test_scoring_choice_is_optional_current_only_and_survives_copy(tmp_path,monk
     payload=json.dumps({'id':'q','query':'计分试验','video_path':'video.mp4'}).encode()
     with TestClient(server.app) as client:
         run=client.post('/api/import',files={'file':('test.jsonl',payload)}).json()
-        assert run['experiment_selection_scoring']=='content_weight'
+        assert run['experiment_selection_scoring']=='new_content_ratio'
         path=f"/api/runs/{run['id']}/start"
         assert client.post(path,json={'experiment_selection_scoring':'invalid'}).status_code==422
         started=client.post(path,json={'run_mode':'both','experiment_selection_scoring':'new_content_ratio'}).json()
         base=server.read_run(started['chain_ids']['base']);experiment=server.read_run(started['chain_ids']['current'])
         assert 'overrides' not in base['algorithm']
-        assert experiment['algorithm']['overrides']['selection_scoring']=='new_content_ratio'
+        assert experiment['algorithm']['defaults']['selection_scoring']=='new_content_ratio'
         assert started['chains'][1]['selection_scoring']=='new_content_ratio'
         copied=client.post(f"/api/runs/{experiment['id']}/copy").json()
         assert copied['experiment_selection_scoring']=='new_content_ratio'
         # both 的导入预览仍展示 base；开始后实验链路才应用保留的计分选择。
         restarted=client.post(f"/api/runs/{copied['id']}/start",json={'run_mode':'both'}).json()
         repeated=server.read_run(restarted['chain_ids']['current'])
-        assert repeated['algorithm']['overrides']['selection_scoring']=='new_content_ratio'
+        assert repeated['algorithm']['defaults']['selection_scoring']=='new_content_ratio'
+
+
+def test_accepted_ratio_default_10_cap_and_explicit_old_score(tmp_path,monkeypatch):
+    monkeypatch.setattr(server,'RUNS',tmp_path/'runs')
+    monkeypatch.setattr(server.POOL,'submit',lambda *args:None)
+    payload=json.dumps({'id':'ten','query':'十张上限','video_path':'video.mp4'}).encode()
+    with TestClient(server.app) as client:
+        imported=client.post('/api/import',files={'file':('ten.jsonl',payload)}).json()
+        started=client.post(f"/api/runs/{imported['id']}/start",json={
+            'run_mode':'current','experiment_max_frames':10}).json()
+        assert started['algorithm']['defaults']['selection_scoring']=='new_content_ratio'
+        assert started['algorithm']['overrides']['max_frames']==10
+        copied=client.post(f"/api/runs/{started['id']}/copy").json()
+        old=client.post(f"/api/runs/{copied['id']}/start",json={
+            'run_mode':'current','experiment_selection_scoring':'content_weight','experiment_max_frames':10}).json()
+        assert old['algorithm']['overrides']['selection_scoring']=='content_weight'
+        fresh=client.post(f"/api/runs/{old['id']}/copy").json()
+        assert fresh['experiment_selection_scoring']=='new_content_ratio'

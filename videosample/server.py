@@ -143,7 +143,7 @@ def import_table(file: UploadFile = File(...)):
            "filename": filename, "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
            "version": algorithms.snapshot("current")["algorithm_version"],
            "algorithm": algorithms.snapshot("current", max_frames=15), "run_mode": "current",
-           "experiment_max_frames": 15, "experiment_selection_scoring": "content_weight", "status": "imported",
+           "experiment_max_frames": 15, "experiment_selection_scoring": "new_content_ratio", "status": "imported",
            "warnings": warnings, "errors": errors, "sheet": sheet, "summary": summary,
            "rows": [{"index": index, "item": item, "status": "ready", "message": "等待开始"}
                     for index, item in enumerate(items)]}
@@ -268,7 +268,7 @@ def start(identity: str, request: StartRequest):
         indices = sorted(set(request.indices if request.indices is not None else range(len(run["rows"]))))
         if not indices or any(index < 0 or index >= len(run["rows"]) for index in indices):
             raise HTTPException(422, "请勾选有效样本")
-        scoring = request.experiment_selection_scoring or run.get('experiment_selection_scoring', 'content_weight')
+        scoring = request.experiment_selection_scoring or run.get('experiment_selection_scoring', 'new_content_ratio')
         selected = set(indices)
         for row in run["rows"]:
             row.update(status="queued" if row["index"] in selected else "skipped",
@@ -307,8 +307,7 @@ def copy_run(identity: str):
                    for row in run["rows"]]
     run["run_mode"] = run.get("run_mode", "current")
     run["experiment_max_frames"] = 15
-    run['experiment_selection_scoring'] = run.get('experiment_selection_scoring',
-        run.get('algorithm', {}).get('overrides', {}).get('selection_scoring', 'content_weight'))
+    run['experiment_selection_scoring'] = 'new_content_ratio'
     run["algorithm"] = algorithms.snapshot("current" if run["run_mode"] == "current" else "base",
                                            max_frames=run["experiment_max_frames"],
                                            selection_scoring=run['experiment_selection_scoring'])
