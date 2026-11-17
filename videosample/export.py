@@ -102,6 +102,7 @@ def workbook_bytes(run, directory: Path, statistics, exported_at):
     for key, label in [('total_samples', '全部样本数'), ('selected_samples', '已选样本数'),
                        ('successful_samples', '成功样本数'), ('failed_samples', '失败及中断样本数'), ('extraction_max_s', '最长抽帧耗时（秒）')]:
         append(overview, [label, statistics.get(key)])
+    append(overview, ['保留下载视频', run.get('retain_downloaded_video', True)])
     append(overview, ['待开始/等待/运行样本数', sum(r.get('status') in {'ready', 'queued', 'running'} for r in run.get('rows', []))])
     for key, label in [('sample_time_s', '每题总耗时（秒）'), ('extraction_time_s', '抽帧耗时（秒）'),
                        ('initial_frames', '初始候选张数'), ('final_frames', '最终输出张数')]:
@@ -149,6 +150,7 @@ def workbook_bytes(run, directory: Path, statistics, exported_at):
         rows.append(data)
     columns = [('有效样本序号', 'number'), ('样本编号', 'row.item.id'), ('题目', 'row.item.query'), ('状态', 'status'),
                ('错误', 'row.error'), ('视频路径', 'row.item.video_path'), ('视频时长（秒）', 'row.duration'),
+               ('下载副本清理提醒', 'row.download_cleanup_error'),
                ('指定开始（秒）', 'row.item.task_start_time'), ('指定结束（秒）', 'row.item.task_end_time'),
                ('实际开始（秒）', 'begin'), ('实际结束（秒）', 'end'), ('算法版本', 'version'),
                ('张数上限', 'config.max_frames'), ('每秒采样帧数', 'config.sample_fps'), ('评分策略', 'scoring'),

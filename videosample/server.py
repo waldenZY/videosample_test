@@ -21,7 +21,7 @@ from urllib.parse import quote
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
@@ -31,12 +31,14 @@ from .download import download_remote_video, is_remote_video_url
 from .preparation import _operation_timing, resolve_operation_video_path
 from .table_dataset import convert_table
 from .web.parse_input import parse_jsonl
+from .storage import managed_directory, remove_download, remove_tombstone
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNS = Path(os.environ.get("VIDEOSAMPLE_RUNS", str(ROOT / "runs"))).resolve()
 LOCK = threading.RLock()
 POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="frame")
 VIDEO_LOCKS = {}
+ACTIVE_JOBS = set()
 LOCAL_TIME = timezone(timedelta(hours=8), name='Asia/Shanghai')
 
 
@@ -85,6 +87,12 @@ def update_row(identity, index, **values):
 @asynccontextmanager
 async def lifespan(app):
     RUNS.mkdir(parents=True, exist_ok=True)
+    for path in RUNS.glob('.deleting-*'):
+        try:
+            remove_tombstone(RUNS, path.name)
+        except (OSError, ValueError):
+            # Retain a failed deletion for the next restart; never recreate the run.
+            continue
     with LOCK:
         for path in RUNS.glob("*/run.json"):
             try:
@@ -97,6 +105,18 @@ async def lifespan(app):
                     save_run(run)
             except (OSError, ValueError, KeyError):
                 continue
+    # Recover downloads left by an interrupted process. Old records without a
+    # retention setting keep their files; only explicitly opted-out runs qualify.
+    for path in RUNS.glob('*/run.json'):
+        try:
+            run = read_run(path.parent.name)
+            if run.get('group_id', run['id']) != run['id'] or run.get('retain_downloaded_video', True):
+                continue
+            for folder in (path.parent / 'inputs').glob('*'):
+                if folder.name.isdigit():
+                    cleanup_sample_download(run['id'], int(folder.name))
+        except (OSError, ValueError, HTTPException):
+            continue
     yield
 
 
@@ -169,7 +189,7 @@ def import_table(file: UploadFile = File(...)):
            "version": algorithms.snapshot("current")["algorithm_version"],
            "algorithm": algorithms.snapshot("current", max_frames=15), "run_mode": "current",
            "experiment_max_frames": 15, "experiment_sample_fps": 3.0,
-           "experiment_selection_scoring": "new_content_ratio", "status": "imported",
+           "experiment_selection_scoring": "new_content_ratio", "retain_downloaded_video": False, "status": "imported",
            "warnings": warnings, "errors": errors, "sheet": sheet, "summary": summary,
            "rows": [{"index": index, "item": item, "status": "ready", "message": "等待开始"}
                     for index, item in enumerate(items)]}
@@ -191,6 +211,7 @@ def list_runs():
             result.append({key: run[key] for key in ("id", "name", "status", "created_at", "version")}
                           | {"status": combined_status, "count": sum(c["count"] for c in chains),
                              "algorithm": run.get("algorithm"),
+                             "retain_downloaded_video": run.get('retain_downloaded_video', True),
                              "chains": chains, "done": sum(c["done"] for c in chains)})
         except (OSError, ValueError, HTTPException):
             continue
@@ -203,6 +224,84 @@ def get_run(identity: str):
     run["statistics"] = chain_statistics(run)
     run["chains"] = chain_summaries(run)
     return run
+
+
+def related_runs(run):
+    """Read and validate a whole batch, including a request made via its child."""
+    root = read_run(run.get('group_id', run['id']))
+    ids = list(dict.fromkeys((root.get('chain_ids') or {'single': root['id']}).values()))
+    if root['id'] not in ids or run['id'] not in ids:
+        raise HTTPException(409, '批次关联信息不完整，不能清理')
+    chains = [read_run(identity) for identity in ids]
+    if any(c.get('group_id', c['id']) != root['id'] for c in chains):
+        raise HTTPException(409, '批次关联信息不一致，不能清理')
+    return root, chains
+
+
+def cleanup_sample_download(identity, index):
+    with LOCK:
+        run = read_run(identity)
+        if run.get('retain_downloaded_video', True):
+            return
+        root, chains = related_runs(run)
+        if root.get('retain_downloaded_video', True):
+            return
+        if index < 0 or any(index >= len(c['rows']) for c in chains):
+            return
+        if any((c['id'], index) in ACTIVE_JOBS or c['rows'][index]['status'] in {'queued', 'running'} for c in chains):
+            return
+        VIDEO_LOCKS.pop((root['id'], index), None)
+        if not is_remote_video_url(root['rows'][index]['item'].get('video_path', '')):
+            return
+        try:
+            removed = remove_download(RUNS, root['id'], index)
+        except (OSError, ValueError) as exc:
+            for chain in chains:
+                row = chain['rows'][index]
+                message = f'下载副本清理失败，文件暂留：{exc}'
+                row['download_cleanup_error'] = message
+                row['warnings'] = [w for w in row.get('warnings', []) if not w.startswith('下载副本清理失败')] + [message]
+                save_run(chain)
+        else:
+            if removed:
+                for chain in chains:
+                    row = chain['rows'][index]
+                    if row.pop('download_cleanup_error', None):
+                        row['warnings'] = [w for w in row.get('warnings', []) if not w.startswith('下载副本清理失败')]
+                        save_run(chain)
+
+
+@app.delete('/api/runs/{identity}')
+def delete_run(identity: str):
+    renamed = []
+    with LOCK:
+        root, chains = related_runs(read_run(identity))
+        ids = {c['id'] for c in chains}
+        if any(job[0] in ids for job in ACTIVE_JOBS) or any(
+            c.get('status') == 'running' or any(r['status'] in {'queued', 'running'} for r in c['rows']) for c in chains):
+            raise HTTPException(409, '本批仍有排队或运行任务，请全部结束后再删除')
+        try:
+            # Validate every absolute target before any recursive removal/move.
+            sources = [managed_directory(RUNS, c['id']) for c in chains]
+            targets = [managed_directory(RUNS, '.deleting-' + uuid.uuid4().hex, deleting=True) for _ in chains]
+            for source, target in zip(sources, targets):
+                source.rename(target)
+                renamed.append((source, target))
+        except (OSError, ValueError) as exc:
+            for source, target in reversed(renamed):
+                target.rename(source)
+            raise HTTPException(409, f'暂时无法删除批次：{exc}') from exc
+        for key in list(VIDEO_LOCKS):
+            if key[0] in ids:
+                VIDEO_LOCKS.pop(key, None)
+    failures = []
+    for _, target in renamed:
+        try:
+            remove_tombstone(RUNS, target.name)
+        except (OSError, ValueError):
+            failures.append(target.name)
+    return {'deleted_ids': sorted(ids), 'cleanup_pending': bool(failures),
+            'message': '记录已删除；部分文件暂时被占用，下次启动将补清理' if failures else '已删除本批记录及占用文件'}
 
 
 @app.get('/api/runs/{identity}/export.xlsx')
@@ -298,6 +397,7 @@ class StartRequest(BaseModel):
     experiment_max_frames: int = Field(default=15, strict=True, ge=2)
     experiment_sample_fps: float = Field(default=3.0, gt=0, allow_inf_nan=False)
     experiment_selection_scoring: Literal['new_content_ratio'] | None = None
+    retain_downloaded_video: bool = Field(default=False, strict=True)
 
     @field_validator('experiment_sample_fps', mode='before')
     @classmethod
@@ -328,6 +428,7 @@ def start(identity: str, request: StartRequest):
         run.update(group_id=identity, chain_ids=chain_ids, run_mode=request.run_mode,
                    experiment_max_frames=request.experiment_max_frames,
                    experiment_sample_fps=request.experiment_sample_fps,
+                   retain_downloaded_video=request.retain_downloaded_video,
                    experiment_selection_scoring=scoring)
         for key, chain_id in chain_ids.items():
             chain = deepcopy(run)
@@ -358,6 +459,7 @@ def copy_run(identity: str):
     run["run_mode"] = run.get("run_mode", "current")
     run["experiment_max_frames"] = 15
     run['experiment_sample_fps'] = 3.0
+    run['retain_downloaded_video'] = False
     run['experiment_selection_scoring'] = 'new_content_ratio'
     run["algorithm"] = algorithms.snapshot("current" if run["run_mode"] == "current" else "base",
                                            max_frames=run["experiment_max_frames"],
@@ -385,6 +487,18 @@ def prepared_video(run, index, item):
 
 
 def process_row(identity: str, index: int):
+    with LOCK:
+        read_run(identity)
+        ACTIVE_JOBS.add((identity, index))
+    try:
+        _process_row(identity, index)
+    finally:
+        with LOCK:
+            ACTIVE_JOBS.discard((identity, index))
+            cleanup_sample_download(identity, index)
+
+
+def _process_row(identity: str, index: int):
     started = time.monotonic()
     directory = run_directory(identity) / "items" / f"{index:05d}"
     directory.mkdir(parents=True, exist_ok=True)
@@ -399,7 +513,6 @@ def process_row(identity: str, index: int):
             update_row(identity, index, message="正在下载视频")
         with measure_phase(timings, "video_prepare"):
             video = prepared_video(run, index, item)
-            (directory / "video_ref.json").write_text(json.dumps({"path": str(video)}, ensure_ascii=False), encoding="utf-8")
         with measure_phase(timings, "probe"):
             duration = algorithm.probe_duration(video)
             if duration <= 0:
@@ -496,11 +609,14 @@ def image(identity: str, index: int, frame_id: str, thumb: bool = False):
 
 @app.get("/api/runs/{identity}/items/{index}/video")
 def video(identity: str, index: int):
-    directory = item_directory(identity, index)
-    reference = directory / "video_ref.json"
-    if not reference.is_file():
-        raise HTTPException(404, "视频尚未准备好")
-    path = Path(json.loads(reference.read_text(encoding="utf-8"))["path"])
-    if not path.is_file():
-        raise HTTPException(404, "原视频已不存在")
+    run = read_run(identity)
+    if index < 0 or index >= len(run['rows']):
+        raise HTTPException(404, '样本不存在')
+    source = run['rows'][index]['item']['video_path']
+    if is_remote_video_url(source):
+        return RedirectResponse(source.strip(), status_code=307)
+    try:
+        path = resolve_operation_video_path(source, base_dir=ROOT)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
     return FileResponse(path)

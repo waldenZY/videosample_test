@@ -1,4 +1,4 @@
-"""下载实现摘自 auto_eval；实验期间将视频保留在本次运行目录。"""
+"""下载实现摘自 auto_eval；副本保留与清理由平台管理。"""
 from __future__ import annotations
 import threading
 import time

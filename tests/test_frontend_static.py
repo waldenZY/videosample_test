@@ -82,6 +82,16 @@ assert(html.includes('id="frameLimit" type="number"'));
 assert(html.includes('id="sampleFps" type="number"'));
 assert(!html.includes('id="experimentScoring"'));
 assert(html.includes('id="exportRun"'));
+assert(html.includes('id="deleteRun"'));assert(html.includes('id="retainVideo"'));
+assert(!html.includes('<video'));assert(!html.includes('id="seekVideo"'));
+vm.runInContext(`current={id:'batch'};setOriginalVideo({index:2,item:{video_path:'https://example.test/original.mp4?token=x'}})`,context);
+assert.equal(element('videoLink').href,'https://example.test/original.mp4?token=x');
+vm.runInContext(`setOriginalVideo({index:2,item:{video_path:'/server/original.mp4'}})`,context);
+assert.equal(element('videoLink').href,'/api/runs/batch/items/2/video');
+element('sampleParking').append=()=>{};
+vm.runInContext(`current={id:'batch',algorithm:{key:'current'},rows:[{index:0,status:'ready',item:{id:'one',query:'未批跑',video_path:'https://example.test/source.mp4'}}]};renderBatch=()=>{};api=()=>{throw Error('Must not request extraction trace for unrun sample')};openSample(0)`,context);
+assert.equal(element('videoLink').href,'https://example.test/source.mp4');
+assert(element('sampleInfo').textContent.includes('尚无抽帧结果'));
 assert(context.configLabel({algorithm:{key:'current',defaults:{max_frames:15,sample_fps:3,selection_scoring:'new_content_ratio'},overrides:{max_frames:25,sample_fps:.5}}}).includes('最多 25 张 · 0.5 帧/秒'));
 assert(html.includes('step="any"'));
 '''
