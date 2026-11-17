@@ -35,7 +35,7 @@ def test_only_selected_chains_are_submitted_and_mode_survives_copy(tmp_path, mon
         assert copied["algorithm"]["key"] == keys[0]
 
 
-@pytest.mark.parametrize("limit", [5, 10, 15])
+@pytest.mark.parametrize("limit", [2, 5, 10, 15, 25])
 def test_experiment_limit_is_saved_only_on_experiment_and_rerun_defaults_to_15(tmp_path, monkeypatch, limit):
     monkeypatch.setattr(server, "RUNS", tmp_path / "runs")
     monkeypatch.setattr(server.POOL, "submit", lambda *args: None)
@@ -45,14 +45,14 @@ def test_experiment_limit_is_saved_only_on_experiment_and_rerun_defaults_to_15(t
         assert imported["experiment_max_frames"] == 15
         identity = imported["id"]
         assert client.post(f"/api/runs/{identity}/start",
-                           json={"experiment_max_frames": 25}).status_code == 422
+                           json={"experiment_max_frames": 1}).status_code == 422
         started = client.post(f"/api/runs/{identity}/start", json={"run_mode": "both",
                               "experiment_max_frames": limit}).json()
         base = server.read_run(started["chain_ids"]["base"])
         experiment = server.read_run(started["chain_ids"]["current"])
         assert "overrides" not in base["algorithm"]
         assert base["algorithm"]["defaults"]["max_frames"] == 20
-        assert experiment["algorithm"]["overrides"] == {"max_frames": limit}
+        assert experiment["algorithm"]["overrides"] == {"max_frames": limit, "sample_fps": 3.0}
         assert started["chains"][1]["frame_limit"] == limit
         copied = client.post(f"/api/runs/{experiment['id']}/copy").json()
         assert copied["experiment_max_frames"] == 15
@@ -80,7 +80,7 @@ def test_scoring_choice_is_optional_current_only_and_survives_copy(tmp_path,monk
         assert repeated['algorithm']['defaults']['selection_scoring']=='new_content_ratio'
 
 
-def test_accepted_ratio_default_10_cap_and_explicit_old_score(tmp_path,monkeypatch):
+def test_accepted_ratio_default_10_cap_and_old_score_rejected(tmp_path,monkeypatch):
     monkeypatch.setattr(server,'RUNS',tmp_path/'runs')
     monkeypatch.setattr(server.POOL,'submit',lambda *args:None)
     payload=json.dumps({'id':'ten','query':'十张上限','video_path':'video.mp4'}).encode()
@@ -91,8 +91,7 @@ def test_accepted_ratio_default_10_cap_and_explicit_old_score(tmp_path,monkeypat
         assert started['algorithm']['defaults']['selection_scoring']=='new_content_ratio'
         assert started['algorithm']['overrides']['max_frames']==10
         copied=client.post(f"/api/runs/{started['id']}/copy").json()
-        old=client.post(f"/api/runs/{copied['id']}/start",json={
-            'run_mode':'current','experiment_selection_scoring':'content_weight','experiment_max_frames':10}).json()
-        assert old['algorithm']['overrides']['selection_scoring']=='content_weight'
-        fresh=client.post(f"/api/runs/{old['id']}/copy").json()
-        assert fresh['experiment_selection_scoring']=='new_content_ratio'
+        response=client.post(f"/api/runs/{copied['id']}/start",json={
+            'run_mode':'current','experiment_selection_scoring':'content_weight','experiment_max_frames':10})
+        assert response.status_code==422
+        assert server.read_run(copied['id'])['status']=='imported'

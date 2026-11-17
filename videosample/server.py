@@ -9,18 +9,21 @@ import re
 import threading
 import time
 import uuid
+import io
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, contextmanager
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from numbers import Real
 from typing import Literal
+from urllib.parse import quote
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from . import media
 from . import algorithms
@@ -34,6 +37,17 @@ RUNS = Path(os.environ.get("VIDEOSAMPLE_RUNS", str(ROOT / "runs"))).resolve()
 LOCK = threading.RLock()
 POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="frame")
 VIDEO_LOCKS = {}
+LOCAL_TIME = timezone(timedelta(hours=8), name='Asia/Shanghai')
+
+
+def task_name(filename, created_at):
+    return f"{created_at[:19].replace('T', ' ')}_{filename}"
+
+
+def saved_config(run):
+    """Only saved defaults/overrides; never infer historical values from today's code."""
+    algorithm = run.get('algorithm') or {}
+    return {**algorithm.get('defaults', {}), **algorithm.get('overrides', {})}
 
 
 def run_directory(identity: str) -> Path:
@@ -90,6 +104,16 @@ app = FastAPI(title="抽帧实验台", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 
 
+@app.exception_handler(RequestValidationError)
+async def invalid_request(request, exc):
+    labels = {'experiment_max_frames': '最多保留张数须为至少 2 的整数',
+              'experiment_sample_fps': '每秒采样帧数须为大于 0 的有限数字，可以填小数',
+              'experiment_selection_scoring': '实验评分固定为新增比例，不能选择其他策略'}
+    messages = [labels[e['loc'][-1]] for e in exc.errors() if e.get('loc') and e['loc'][-1] in labels]
+    errors = json.loads(json.dumps(exc.errors(), default=str), parse_constant=lambda value: value)
+    return JSONResponse(status_code=422, content={'detail': '；'.join(dict.fromkeys(messages)) if messages else errors})
+
+
 @app.get("/")
 def home():
     return FileResponse(ROOT / "static" / "index.html")
@@ -139,11 +163,13 @@ def import_table(file: UploadFile = File(...)):
         items, errors = parse_jsonl(jsonl, "operation")
     except (ValueError, ImportError, OSError) as exc:
         raise HTTPException(422, str(exc)) from exc
-    run = {"id": identity, "name": Path(filename).stem,
-           "filename": filename, "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    created_at = datetime.now(LOCAL_TIME).isoformat(timespec='seconds')
+    run = {"id": identity, "name": task_name(filename, created_at),
+           "filename": filename, "created_at": created_at,
            "version": algorithms.snapshot("current")["algorithm_version"],
            "algorithm": algorithms.snapshot("current", max_frames=15), "run_mode": "current",
-           "experiment_max_frames": 15, "experiment_selection_scoring": "new_content_ratio", "status": "imported",
+           "experiment_max_frames": 15, "experiment_sample_fps": 3.0,
+           "experiment_selection_scoring": "new_content_ratio", "status": "imported",
            "warnings": warnings, "errors": errors, "sheet": sheet, "summary": summary,
            "rows": [{"index": index, "item": item, "status": "ready", "message": "等待开始"}
                     for index, item in enumerate(items)]}
@@ -179,6 +205,19 @@ def get_run(identity: str):
     return run
 
 
+@app.get('/api/runs/{identity}/export.xlsx')
+def export_run(identity: str):
+    from .export import workbook_bytes
+    run = read_run(identity)
+    timestamp = datetime.now(LOCAL_TIME)
+    config = saved_config(run)
+    data = workbook_bytes(run, run_directory(identity), chain_statistics(run), timestamp.isoformat(timespec='seconds'))
+    name = f"{run.get('name', identity)}_{run.get('algorithm', {}).get('key', '历史')}_{config.get('max_frames', '未记录')}张_{config.get('sample_fps', '未记录')}fps_{timestamp:%Y%m%d_%H%M%S}.xlsx"
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', '_', name)
+    return StreamingResponse(io.BytesIO(data), media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                             headers={'Content-Disposition': f"attachment; filename=results.xlsx; filename*=UTF-8''{quote(name)}"})
+
+
 def chain_statistics(run):
     """只统计本次链路的成功样本；缺失数据不按零计入平均值。"""
     rows = run.get("rows", [])
@@ -193,13 +232,13 @@ def chain_statistics(run):
     durations = [(row.get('timings_s') or {}).get('extraction') for row in successful]
     durations = [float(value) for value in durations if isinstance(value, Real)
                  and not isinstance(value, bool) and math.isfinite(value) and value >= 0]
-    distribution = {'1-5': 0, '6-10': 0, '11-14': 0, '15': 0, 'other': 0}
+    distribution = {'1-5': 0, '6-10': 0, '11-14': 0, '15': 0, '16+': 0, 'other': 0}
     distribution_samples = 0
     for row in successful:
         value = row.get('frame_count')
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             continue
-        bucket = '1-5' if 1 <= value <= 5 else '6-10' if 6 <= value <= 10 else '11-14' if 11 <= value <= 14 else '15' if value == 15 else 'other'
+        bucket = '1-5' if 1 <= value <= 5 else '6-10' if 6 <= value <= 10 else '11-14' if 11 <= value <= 14 else '15' if value == 15 else '16+' if value > 15 else 'other'
         distribution[bucket] += 1
         distribution_samples += 1
     selections = [row['selection'] for row in successful if isinstance(row.get('selection'), dict)
@@ -246,6 +285,7 @@ def chain_summaries(run):
                            if key == 'current' else None),
                        "frame_limit": (chain.get("algorithm", {}).get("overrides", {}).get("max_frames")
                                        if key == "current" else None),
+                       "effective_config": saved_config(chain),
                        "done": sum(row["status"] == "done" for row in chain["rows"]),
                        "failed": sum(row["status"] in {"error", "interrupted"} for row in chain["rows"])})
     return result
@@ -255,8 +295,16 @@ class StartRequest(BaseModel):
     indices: list[int] | None = None
     name: str = ""
     run_mode: Literal["base", "current", "both"] = "both"
-    experiment_max_frames: Literal[5, 10, 15] = 15
-    experiment_selection_scoring: Literal['content_weight', 'new_content_ratio'] | None = None
+    experiment_max_frames: int = Field(default=15, strict=True, ge=2)
+    experiment_sample_fps: float = Field(default=3.0, gt=0, allow_inf_nan=False)
+    experiment_selection_scoring: Literal['new_content_ratio'] | None = None
+
+    @field_validator('experiment_sample_fps', mode='before')
+    @classmethod
+    def numeric_fps(cls, value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError('每秒采样帧数必须是大于 0 的数字，可以填小数')
+        return value
 
 
 @app.post("/api/runs/{identity}/start")
@@ -268,7 +316,7 @@ def start(identity: str, request: StartRequest):
         indices = sorted(set(request.indices if request.indices is not None else range(len(run["rows"]))))
         if not indices or any(index < 0 or index >= len(run["rows"]) for index in indices):
             raise HTTPException(422, "请勾选有效样本")
-        scoring = request.experiment_selection_scoring or run.get('experiment_selection_scoring', 'new_content_ratio')
+        scoring = 'new_content_ratio'
         selected = set(indices)
         for row in run["rows"]:
             row.update(status="queued" if row["index"] in selected else "skipped",
@@ -279,11 +327,13 @@ def start(identity: str, request: StartRequest):
         chain_ids = {key: identity if index == 0 else uuid.uuid4().hex for index, key in enumerate(keys)}
         run.update(group_id=identity, chain_ids=chain_ids, run_mode=request.run_mode,
                    experiment_max_frames=request.experiment_max_frames,
+                   experiment_sample_fps=request.experiment_sample_fps,
                    experiment_selection_scoring=scoring)
         for key, chain_id in chain_ids.items():
             chain = deepcopy(run)
             chain["id"] = chain_id
             chain["algorithm"] = algorithms.snapshot(key, max_frames=request.experiment_max_frames,
+                                                       sample_fps=request.experiment_sample_fps,
                                                        selection_scoring=scoring)
             chain["version"] = chain["algorithm"]["algorithm_version"]
             save_run(chain)
@@ -298,8 +348,8 @@ def start(identity: str, request: StartRequest):
 def copy_run(identity: str):
     run = read_run(identity)
     run["id"] = uuid.uuid4().hex
-    run["name"] += " · 重跑"
-    run["created_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    run["created_at"] = datetime.now(LOCAL_TIME).isoformat(timespec="seconds")
+    run["name"] = task_name(run.get('filename', '历史输入'), run['created_at'])
     run["status"] = "imported"
     run.pop("group_id", None)
     run.pop("chain_ids", None)
@@ -307,9 +357,11 @@ def copy_run(identity: str):
                    for row in run["rows"]]
     run["run_mode"] = run.get("run_mode", "current")
     run["experiment_max_frames"] = 15
+    run['experiment_sample_fps'] = 3.0
     run['experiment_selection_scoring'] = 'new_content_ratio'
     run["algorithm"] = algorithms.snapshot("current" if run["run_mode"] == "current" else "base",
                                            max_frames=run["experiment_max_frames"],
+                                           sample_fps=run['experiment_sample_fps'],
                                            selection_scoring=run['experiment_selection_scoring'])
     run["version"] = run["algorithm"]["algorithm_version"]
     with LOCK:
@@ -358,8 +410,9 @@ def process_row(identity: str, index: int):
                 overrides = run["algorithm"].get("overrides", {})
                 if "max_frames" in overrides:
                     kwargs["max_frames"] = overrides["max_frames"]
-                if 'selection_scoring' in overrides:
-                    kwargs['selection_scoring'] = overrides['selection_scoring']
+                if 'sample_fps' in overrides:
+                    kwargs['sample_fps'] = overrides['sample_fps']
+                kwargs['selection_scoring'] = 'new_content_ratio'
         with measure_phase(timings, "fingerprint"):
             with video.open("rb") as handle:
                 digest = hashlib.sha256()

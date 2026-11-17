@@ -2,3 +2,5 @@
 .sample-toggle{border:0;background:transparent;padding:3px 0;font-weight:600;text-align:left;white-space:normal}.sample-toggle:hover{background:transparent;color:var(--green)}tr.expanded{background:#eef4eb}.sample-detail-row>td{padding:0;white-space:normal;background:#f8faf6}.sample-detail-row #sample{border:0;border-radius:0;margin:0;max-width:calc(100vw - 340px)}@media(max-width:900px){.sample-detail-row #sample{max-width:calc(100vw - 65px)}}
 #timingBreakdown{max-width:650px;margin:12px 0}.timing-line{display:flex;justify-content:space-between;gap:20px;padding:7px 10px;border-bottom:1px solid var(--line);font-size:12px}.timing-stage{padding-left:24px;color:var(--muted)}
 .selection-info{background:#eef4eb;border:1px solid var(--line);border-radius:8px;padding:12px;margin:12px 0;font-size:13px}.selection-info p{margin:8px 0}.selection-info button{margin-top:10px}
+
+#startOptions label{display:inline-flex;flex-direction:column;vertical-align:top;gap:6px;margin:8px 14px 8px 0}#startOptions small{max-width:280px;color:var(--muted);font-size:11px}#frameLimit,#sampleFps{width:140px}

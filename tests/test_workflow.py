@@ -65,6 +65,21 @@ def test_base_recording_preserves_original_results(tmp_path, video, baseline, kw
     assert any(stage["removed_ids"] for stage in trace["stages"])
 
 
+def test_fractional_sampling_changes_real_collection_and_is_saved(tmp_path, video):
+    counts = []
+    for fps in (.5, 2.5):
+        folder = tmp_path / str(fps)
+        with media.record_process(folder / 'process') as record:
+            frames = media.extract_scene_keyframes(video, folder / 'final', task_end_time=13,
+                                                    sample_fps=fps, max_frames=25)
+        saved = json.loads((folder / 'final/keyframes.json').read_text('utf8'))
+        assert saved['config']['sample_fps'] == fps and saved['config']['max_frames'] == 25
+        assert saved['config']['selection_scoring'] == 'new_content_ratio'
+        assert len(frames) <= 25
+        counts.append(len(record.stages[0]['output_ids']))
+    assert counts[0] < counts[1]
+
+
 def test_plain_extraction_has_no_process_outputs(tmp_path, video):
     out = tmp_path / "plain"
     media.extract_scene_keyframes(video, out, task_end_time=13)

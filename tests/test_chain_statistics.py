@@ -57,7 +57,7 @@ def test_output_distribution_and_hit_limit_use_actual_stop_reason():
              {'status': 'error', 'frame_count': 15, 'selection': {'stop_reason': 'limit_reached'}}]
     stats = server.chain_statistics({'rows': rows})
     assert stats['output_distribution'] == {'samples': 5, 'counts':
-            {'1-5': 1, '6-10': 2, '11-14': 1, '15': 1, 'other': 0}}
+            {'1-5': 1, '6-10': 2, '11-14': 1, '15': 1, '16+': 0, 'other': 0}}
     assert stats['adaptive_selection']['samples'] == 4
     assert stats['adaptive_selection']['hit_limit_count'] == 2
     assert stats['adaptive_selection']['hit_limit_rate'] == .5

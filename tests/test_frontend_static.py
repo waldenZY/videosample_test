@@ -76,9 +76,13 @@ assert(context.renderScoreComparison({comparison_status:'anchors_filled_limit'})
 assert(context.renderScoreComparison({last_selected_comparison:{round:15}}).includes('旧版只保存'));
 assert.equal(context.renderScoreComparison({}), '');
 const html=fs.readFileSync('static/index.html','utf8');
-assert(html.includes('自适应，最多 15 张'));assert(html.includes('数量分布 / 停止情况'));
-assert(html.includes('新增权重（旧版）'));assert(html.includes('新增比例（默认）'));
-assert(html.includes('<select id="frameLimit">'));
-assert(html.includes('value="10">自适应，最多 10 张'));
+assert(html.includes('value="15"'));assert(html.includes('数量分布 / 停止情况'));
+assert(!html.includes('新增权重（旧版）'));assert(html.includes('新增比例（固定）'));
+assert(html.includes('id="frameLimit" type="number"'));
+assert(html.includes('id="sampleFps" type="number"'));
+assert(!html.includes('id="experimentScoring"'));
+assert(html.includes('id="exportRun"'));
+assert(context.configLabel({algorithm:{key:'current',defaults:{max_frames:15,sample_fps:3,selection_scoring:'new_content_ratio'},overrides:{max_frames:25,sample_fps:.5}}}).includes('最多 25 张 · 0.5 帧/秒'));
+assert(html.includes('step="any"'));
 '''
     subprocess.run([node, '-e', script], cwd=root, check=True, capture_output=True, text=True, timeout=15)

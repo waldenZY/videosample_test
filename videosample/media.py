@@ -32,7 +32,7 @@ from pathlib import Path
 import numpy as np
 
 
-KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4.12"
+KEYFRAME_ALGORITHM_VERSION = "hybrid-state-exp-v4.13"
 DEFAULT_TASK_START_TIME = 7.0
 DEFAULT_ANALYSIS_MASK_BOX = (.63, .005, .74, .040)
 
@@ -393,8 +393,8 @@ class KeyframeConfig:
             and self.task_end_time <= self.task_start_time
         ):
             raise ValueError("task_end_time 必须大于 task_start_time")
-        if isinstance(self.max_frames, bool) or not isinstance(self.max_frames, Integral) or not 2 <= self.max_frames <= 15:
-            raise ValueError("实验版 max_frames 必须为 2 到 15 的整数")
+        if isinstance(self.max_frames, bool) or not isinstance(self.max_frames, Integral) or self.max_frames < 2:
+            raise ValueError("实验版 max_frames 必须为至少 2 的整数")
         if self.local_analysis_max_edge < 64 or self.local_content_bin_height < 4:
             raise ValueError("局部分析尺寸或内容分段过小")
         if not 0 < self.local_template_threshold <= 1:
@@ -407,8 +407,9 @@ class KeyframeConfig:
         if (isinstance(self.local_match_workers, bool) or not isinstance(self.local_match_workers, Integral)
                 or not 1 <= self.local_match_workers <= 4):
             raise ValueError("local_match_workers 必须为 1 到 4 的整数")
-        if self.sample_fps <= 0:
-            raise ValueError("sample_fps 必须大于 0")
+        if (isinstance(self.sample_fps, bool) or not isinstance(self.sample_fps, Real)
+                or not math.isfinite(self.sample_fps) or self.sample_fps <= 0):
+            raise ValueError("sample_fps 必须为大于 0 的有限数字，可以是小数")
         if self.analysis_mask_box is not None:
             box = self.analysis_mask_box
             if (not isinstance(box, (tuple, list)) or len(box) != 4
@@ -801,7 +802,7 @@ def _extract_candidates(
                     f"{algorithm_end - sample_start:.3f}",
                     "-vf",
                     (
-                        f"fps={config.sample_fps:g},"
+                        f"fps={config.sample_fps:.17g},"
                         f"scale='min({config.max_edge},iw)':-2"
                     ),
                     "-q:v",
@@ -2024,7 +2025,7 @@ def _analyze_local_content_impl(candidates, config, work):
             for observation in track.observations:
                 if float(np.mean((rows >= observation['top']) & (rows < observation['bottom']))) >= .8:
                     analysis.coverage[id(observation['candidate'])].add(key)
-    anchors = {id(c) for c in _selection_anchors(candidates, 15)}
+    anchors = {id(c) for c in _selection_anchors(candidates, config.max_frames)}
     def rank(candidate):
         coverage = analysis.coverage[id(candidate)]
         return (sum(analysis.units[key]['weight'] for key in coverage), len(coverage),
@@ -2447,7 +2448,6 @@ class _SelectionScorer:
 
 def _choose_with_scroll(candidates, analysis, anchors, frame_ids, compare=None, *, limit=15, max_related=3,
                         max_checks=None, routing='mixed', scoring='content_weight', record_competitions=False):
-    limit = min(15, limit)
     order = {id(c): i for (i, c) in enumerate(candidates)}
     lookup = {id(c): c for c in candidates}
     selected = list(anchors[:limit])
@@ -2623,13 +2623,13 @@ def _limit_candidates(candidates, limit, *, config=None, analysis=None):
     covered = set().union(*(analysis.coverage[id(c)] for c in selected)) if selected else set()
     uncovered = required - covered
     uncertain = {key for key in eligible if analysis.units[key]['weight'] == 0} - covered
-    hit = bool(uncovered) and len(selected) >= min(limit, 15)
+    hit = bool(uncovered) and len(selected) >= limit
     reason = 'limit_reached' if hit else 'covered' if not uncovered and not uncertain else 'no_reliable_addition'
     merged_count = sum(len(group['members']) - 1 for group in result['groups'])
     checked = {r[key] for r in comparisons for key in ('a', 'b')}
     analysis.summary = {
         'policy': 'adaptive-scroll-v1' if config.scroll_dedup_enabled else 'adaptive-local-v1',
-        'scoring': config.selection_scoring, 'limit': min(limit, 15), 'stop_reason': reason, 'hit_limit': hit,
+        'scoring': config.selection_scoring, 'limit': limit, 'stop_reason': reason, 'hit_limit': hit,
         'input_count': len(pool), 'representative_count': len(analysis.representatives),
         'identified_content_count': len(required), 'covered_content_count': len(required & covered),
         'uncovered_count': len(uncovered), 'uncertain_content_count': len(uncertain),
@@ -2653,7 +2653,7 @@ def _limit_candidates(candidates, limit, *, config=None, analysis=None):
         candidate.evidence_ids = tuple(sorted(analysis.coverage[identity]))
         missing = analysis.coverage[identity] - covered
         event = events.get(fid)
-        details = {'frame_limit': min(limit, 15), 'coverage_ids': list(candidate.evidence_ids),
+        details = {'frame_limit': limit, 'coverage_ids': list(candidate.evidence_ids),
                    'uncovered_ids': sorted(missing), 'stop_reason': reason,
                    'scoring': config.selection_scoring,
                    'final_remaining_score': final_scorer.metrics(candidate, covered),
@@ -2682,7 +2682,7 @@ def _limit_candidates(candidates, limit, *, config=None, analysis=None):
             rival = lookup[competition['winner']['frame_id']] if competition is not None else None
             if competition is None:
                 details['comparison_status'] = 'anchors_filled_limit' if len(anchor_ids) >= limit else 'not_ranked'
-            _note(candidate, f'达到 {min(limit, 15)} 张上限，此帧仍有内容未覆盖',
+            _note(candidate, f'达到 {limit} 张上限，此帧仍有内容未覆盖',
                   [rival] if rival is not None and rival is not candidate else [],
                   new_content_weight=round(math.fsum(analysis.units[key]['weight'] for key in sorted(missing)), 6),
                   **details)
