@@ -11,3 +11,5 @@ button.danger{color:#a34332;border-color:#d7b0a6}button.danger:hover{background:
 .annotation-form textarea{font:inherit;resize:vertical;padding:8px;border:1px solid var(--line);border-radius:5px}
 .annotation-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .task-cell .status{margin-top:6px}
+.compare-mark{display:block;margin-top:5px;color:var(--muted);font-size:11px}
+.compare-mark[aria-pressed="true"]{color:#83520a;font-weight:600}

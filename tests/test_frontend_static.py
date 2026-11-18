@@ -105,3 +105,58 @@ assert(context.configLabel({algorithm:{key:'current',defaults:{max_frames:15,sam
 assert(html.includes('step="any"'));
 '''
     subprocess.run([node, '-e', script], cwd=root, check=True, capture_output=True, text=True, timeout=15)
+
+
+def test_comparison_marks_follow_batch_and_keep_annotation_per_chain():
+    node = shutil.which('node')
+    if node is None:
+        pytest.skip('Node 仅用于前端回归')
+    root = Path(__file__).resolve().parents[1]
+    script = r'''
+const fs=require('fs'), vm=require('vm'), assert=require('assert');
+const elements=new Map(), storage=new Map();
+function element(id){
+ if(!elements.has(id))elements.set(id,{hidden:false,value:'',append(){},focus(){},querySelector(){return null}});
+ return elements.get(id);
+}
+const context={
+ document:{getElementById:element},fetch:()=>new Promise(()=>{}),setTimeout:()=>0,clearTimeout:()=>{},
+ localStorage:{getItem:key=>storage.get(key)??null,setItem:(key,value)=>storage.set(key,value),removeItem:key=>storage.delete(key)},
+};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync('static/app.js','utf8'),context);
+const rows=[0,1,2].map(index=>({index,status:'done',item:{id:'重复编号',query:'样本 '+index}}));
+const common={group_id:'group',chains:[{id:'base'},{id:'experiment'}],created_at:'2026-11-18T12:00:00',warnings:[],errors:[]};
+context.base={...common,id:'base',rows:structuredClone(rows)};
+context.experiment={...common,id:'experiment',rows:structuredClone(rows)};
+context.other={...common,id:'other-base',group_id:'other',rows:structuredClone(rows)};
+const run=code=>vm.runInContext(code,context);
+function clickMark(index){
+ element('rows').onclick({target:{closest:()=>({dataset:{compareIndex:String(index)}})}});
+}
+(async()=>{
+ element('rowFilter').value='all';
+ run('current=base;renderBatch()');
+ clickMark(1);
+ assert.equal(storage.get('videosample:compare:group'),'[1]');
+ run('current=experiment;renderBatch()');
+ assert(element('rows').innerHTML.includes('data-compare-index="1" aria-pressed="true"'));
+ assert(element('rows').innerHTML.includes('data-compare-index="0" aria-pressed="false"'));
+ element('rowFilter').value='compare';
+ run('comparisonMarks.clear();renderBatch()');
+ assert(element('rows').innerHTML.includes('样本 1'));
+ assert(!element('rows').innerHTML.includes('样本 0'));
+ run(`current=base;renderAnnotation(current.rows[0]);post=async()=>({annotation:{verdict:'missing',note:''}})`);
+ await run("saveAnnotation('missing','')");
+ run('current=experiment;renderBatch()');
+ assert(element('rows').innerHTML.includes('data-compare-index="0" aria-pressed="true"'));
+ assert(!element('rows').innerHTML.includes('发现关键帧遗漏'));
+ clickMark(0);
+ assert(!element('rows').innerHTML.includes('样本 0'));
+ assert.equal(context.base.rows[0].annotation.verdict,'missing');
+ run('current=other;renderBatch()');
+ assert(!element('rows').innerHTML.includes('样本 1'));
+ assert(element('rows').innerHTML.includes('还没有标记'));
+})().catch(error=>{console.error(error);process.exitCode=1});
+'''
+    subprocess.run([node, '-e', script], cwd=root, check=True, capture_output=True, text=True, timeout=15)

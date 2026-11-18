@@ -14,11 +14,41 @@ function closeSample(){
 let current=null, traceData=null, currentIndex=null, stageId='final', chosenFrame=null;
 let selected=new Set(), timer=null, loading=false, detailToken=0;
 let annotationEditor=null, annotationRevision=0;
+const comparisonMarks=new Map();
 async function api(url,options={}){const r=await fetch(url,options);if(!r.ok){let e;try{e=await r.json()}catch{e={detail:r.statusText}}throw Error(typeof e.detail==='string'?e.detail:JSON.stringify(e.detail))}return r.json()}
 function notice(text,error=false){$('notice').hidden=!text;$('notice').textContent=text;$('notice').className=error?'error':''}
 function post(url,data={}){return api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})}
 function configLabel(run){const config={...(run.algorithm?.defaults||{}),...(run.algorithm?.overrides||{})};return `${run.algorithm?.key==='base'?'base 原始方法':scoringNames[config.selection_scoring]||'评分未记录'} · ${run.algorithm?.key==='base'?'数量目标':'最多'} ${config.max_frames??'未记录'} 张 · ${config.sample_fps??'未记录'} 帧/秒`;}
 function rowName(row){return row.item.id||`样本 ${row.index+1}`}
+function comparisonBatch(run){
+ return run?.chains?.length===2?run.group_id:null;
+}
+function marksForBatch(batch){
+ if(!comparisonMarks.has(batch)){
+  let indices=[];
+  try{
+   const saved=JSON.parse(localStorage.getItem(`videosample:compare:${batch}`));
+   if(Array.isArray(saved))indices=saved.filter(index=>Number.isInteger(index)&&index>=0);
+  }catch{/* 浏览器禁用存储时仍可在当前页面使用。 */}
+  comparisonMarks.set(batch,new Set(indices));
+ }
+ return comparisonMarks.get(batch);
+}
+function setComparisonMark(batch,index,marked){
+ const marks=marksForBatch(batch);
+ if(marked)marks.add(index);
+ else marks.delete(index);
+ try{
+  const key=`videosample:compare:${batch}`;
+  if(marks.size)localStorage.setItem(key,JSON.stringify([...marks]));
+  else localStorage.removeItem(key);
+ }catch{/* 本次页面会话仍保留标记。 */}
+}
+function comparisonButton(row,marks){
+ if(!marks)return '';
+ const marked=marks.has(row.index);
+ return `<button type="button" class="plain compare-mark" data-compare-index="${row.index}" aria-pressed="${marked}" aria-label="对照标记 ${esc(rowName(row))}">${marked?'★ 已标记对照':'☆ 标记对照'}</button>`;
+}
 function annotationBadge(row){
  const verdict=row.annotation?.verdict;
  const label=annotationLabels[verdict]||(row.annotation?.note?'有标注备注':'');
@@ -50,12 +80,14 @@ function editAnnotation(){
 async function saveAnnotation(verdict,note){
  const editor=annotationEditor;
  if(!editor||editor.saving)return;
+ const batch=comparisonBatch(current);
  editor.saving=true;
  editor.message='正在保存…';
  renderAnnotation(current.rows[editor.index]);
  try{
   const {annotation}=await post(`/api/runs/${editor.id}/items/${editor.index}/annotation`,{verdict,note});
   annotationRevision++;
+  if(annotation&&batch)setComparisonMark(batch,editor.index,true);
   if(current?.id===editor.id)current.rows[editor.index].annotation=annotation;
   editor.dirty=false;
   editor.message=annotation?'已保存':'已清空';
@@ -63,7 +95,7 @@ async function saveAnnotation(verdict,note){
   editor.message=`保存失败：${error.message}`;
  }finally{
   editor.saving=false;
-  if(current?.id===editor.id)renderBatch();
+  if(current?.id===editor.id||(batch&&comparisonBatch(current)===batch))renderBatch();
  }
 }
 function frameURL(id,thumb=false){return `/api/runs/${current.id}/items/${currentIndex}/frames/${encodeURIComponent(id)}${thumb?'?thumb=true':''}`}
@@ -77,14 +109,23 @@ function renderBatch(){if(!current)return;renderChainTabs();renderChainStatistic
  $('deleteRun').disabled=current.status==='running'||current.chains?.some(c=>c.status==='running');$('deleteRun').title=$('deleteRun').disabled?'本批全部结束后可删除':'删除整批输入副本、结果、过程图片和下载视频';const imported=current.status==='imported';$('start').hidden=!imported;$('start').disabled=!selected.size;$('startOptions').hidden=!imported;if(document.activeElement!==$('runName'))$('runName').value=current.name;
  $('batchMeta').textContent+=' · '+configLabel(current)+' · 下载视频：'+(current.retain_downloaded_video===false?'用完清理':current.retain_downloaded_video===true?'保留':'旧记录保留');
  const messages=[...current.errors,...current.warnings.map(w=>JSON.stringify(w))];$('importDetails').hidden=!messages.length;$('importMessages').textContent=messages.join('\n');
+ const batch=comparisonBatch(current);
+ const marks=batch?marksForBatch(batch):null;
+ const compareOption=$('compareFilter');
+ compareOption.hidden=!marks;
+ compareOption.disabled=!marks;
+ if(!marks&&$('rowFilter').value==='compare')$('rowFilter').value='all';
+ compareOption.textContent=`已标记对照（${marks?.size??0}）`;
  const f=$('rowFilter').value;
- const rows=current.rows.filter(r=>f==='all'||(f==='error'?['error','interrupted'].includes(r.status):f==='running'?['running','queued'].includes(r.status):r.status===f));
+ const rows=current.rows.filter(r=>f==='compare'?marks.has(r.index):
+  f==='all'||(f==='error'?['error','interrupted'].includes(r.status):f==='running'?['running','queued'].includes(r.status):r.status===f));
  // 进度刷新会重建列表，先移出详情以保留图片、筛选与事件绑定。
  const active=document.activeElement;
  const annotationFocus=active&&$('annotationForm').contains(active)?active:null;
  $('sampleParking').append($('sample'));
  if(currentIndex!==null&&!rows.some(r=>r.index===currentIndex))closeSample();
- $('rows').innerHTML=rows.map(r=>`<tr class="clickable ${currentIndex===r.index?'expanded':''}" data-index="${r.index}"><td><input type="checkbox" data-check="${r.index}" ${selected.has(r.index)?'checked':''} ${imported?'':'disabled'} aria-label="选择 ${esc(rowName(r))}"></td><td class="task-cell"><button class="sample-toggle" aria-expanded="${currentIndex===r.index}" aria-controls="sample-detail-${r.index}" aria-label="${currentIndex===r.index?'收起':'展开'} ${esc(rowName(r))}"><span aria-hidden="true">${currentIndex===r.index?'▾':'▸'}</span> ${esc(rowName(r))}</button><small>${esc(r.item.query)}</small>${annotationBadge(r)}</td><td><span class="status ${r.status}">${labels[r.status]||esc(r.status)}</span><div class="muted small">${esc(r.message)}</div>${r.error?`<div class="error-text">${esc(r.error)}</div>`:''}${r.warnings?.length?`<div class="error-text">${esc(r.warnings.join('；'))}</div>`:''}</td>${stages.map(s=>`<td>${r.stage_counts?.[s.id]??'<span class="muted">—</span>'}</td>`).join('')}<td>${r.frame_count??'—'}</td><td>${r.elapsed_s===undefined?'—':r.elapsed_s+'s'}</td></tr><tr class="sample-detail-row" id="sample-detail-${r.index}" hidden><td colspan="${stages.length+5}"><div id="sample-slot-${r.index}"></div></td></tr>`).join('');
+ $('rows').innerHTML=rows.map(r=>`<tr class="clickable ${currentIndex===r.index?'expanded':''}" data-index="${r.index}"><td><input type="checkbox" data-check="${r.index}" ${selected.has(r.index)?'checked':''} ${imported?'':'disabled'} aria-label="选择 ${esc(rowName(r))}"></td><td class="task-cell"><button class="sample-toggle" aria-expanded="${currentIndex===r.index}" aria-controls="sample-detail-${r.index}" aria-label="${currentIndex===r.index?'收起':'展开'} ${esc(rowName(r))}"><span aria-hidden="true">${currentIndex===r.index?'▾':'▸'}</span> ${esc(rowName(r))}</button><small>${esc(r.item.query)}</small>${annotationBadge(r)}${comparisonButton(r,marks)}</td><td><span class="status ${r.status}">${labels[r.status]||esc(r.status)}</span><div class="muted small">${esc(r.message)}</div>${r.error?`<div class="error-text">${esc(r.error)}</div>`:''}${r.warnings?.length?`<div class="error-text">${esc(r.warnings.join('；'))}</div>`:''}</td>${stages.map(s=>`<td>${r.stage_counts?.[s.id]??'<span class="muted">—</span>'}</td>`).join('')}<td>${r.frame_count??'—'}</td><td>${r.elapsed_s===undefined?'—':r.elapsed_s+'s'}</td></tr><tr class="sample-detail-row" id="sample-detail-${r.index}" hidden><td colspan="${stages.length+5}"><div id="sample-slot-${r.index}"></div></td></tr>`).join('');
+ if(f==='compare'&&!rows.length)$('rows').innerHTML=`<tr><td colspan="${stages.length+5}" class="muted">还没有标记。切回“全部”后可选择样本。</td></tr>`;
  if(currentIndex!==null&&!$('sample').hidden){
   const row=current.rows[currentIndex];
   renderTimings(row);
@@ -139,7 +180,27 @@ $('exportRun').onclick=async()=>{if(!current)return;const button=$('exportRun');
 $('deleteRun').onclick=async()=>{if(!current)return;const identity=current.id,name=current.name;if(!window.confirm(`删除“${name}”整批记录？关联的 base/实验结果、候选图片、最终图片和下载视频都会清除，无法恢复；服务器原始视频不会删除。`))return;const button=$('deleteRun');button.disabled=true;try{const result=await api(`/api/runs/${identity}`,{method:'DELETE'});if(current&&result.deleted_ids.includes(current.id)){clearTimeout(timer);closeSample();current=null;selected=new Set();$('batch').hidden=true;$('empty').hidden=false;}await refreshRuns();notice(result.message)}catch(error){notice(error.message,true)}finally{button.disabled=false;if(current)renderBatch()}};
 $('copyRun').onclick=async()=>{try{const run=await post(`/api/runs/${current.id}/copy`);await selectRun(run.id);notice('已新建一次运行，旧结果保留。')}catch(e){notice(e.message,true)}};
 $('runs').onclick=e=>{const button=e.target.closest('[data-run]');if(button)selectRun(button.dataset.run).catch(e=>notice(e.message,true))};
-$('rows').onclick=e=>{if(e.target.matches('[data-check]')){const index=Number(e.target.dataset.check);e.target.checked?selected.add(index):selected.delete(index);$('start').disabled=!selected.size;return}const row=e.target.closest('[data-index]');if(row)openSample(Number(row.dataset.index))};
+$('rows').onclick=e=>{
+ const compare=e.target.closest('[data-compare-index]');
+ if(compare){
+  const batch=comparisonBatch(current);
+  if(!batch)return;
+  const index=Number(compare.dataset.compareIndex);
+  setComparisonMark(batch,index,!marksForBatch(batch).has(index));
+  renderBatch();
+  const updated=$('rows').querySelector(`[data-compare-index="${index}"]`);
+  (updated||$('rowFilter')).focus({preventScroll:true});
+  return;
+ }
+ if(e.target.matches('[data-check]')){
+  const index=Number(e.target.dataset.check);
+  e.target.checked?selected.add(index):selected.delete(index);
+  $('start').disabled=!selected.size;
+  return;
+ }
+ const row=e.target.closest('[data-index]');
+ if(row)openSample(Number(row.dataset.index));
+};
 $('rowHead').onchange=e=>{if(e.target.id==='selectAll'){selected=new Set(e.target.checked?current.rows.map(r=>r.index):[]);renderBatch()}};
 $('rowFilter').onchange=renderBatch;$('frameFilter').onchange=renderGallery;
 $('stages').onclick=e=>{const button=e.target.closest('[data-stage]');if(button){stageId=button.dataset.stage;renderStages();renderGallery()}};
