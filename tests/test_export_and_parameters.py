@@ -24,6 +24,53 @@ def client(tmp_path, monkeypatch):
         yield c
 
 
+def test_annotation_is_saved_per_result_and_exported(client):
+    run = imported(client)
+    stored = server.read_run(run['id'])
+    stored['rows'].extend({'index': index, 'item': stored['rows'][0]['item'], 'status': 'ready'}
+                          for index in range(1, 4))
+    server.save_run(stored)
+    started = client.post(f"/api/runs/{run['id']}/start", json={'run_mode': 'both'}).json()
+    base, current = (started['chain_ids'][key] for key in ('base', 'current'))
+    path = f'/api/runs/{current}/items/0/annotation'
+    assert client.post(path, json={'verdict': 'missing'}).status_code == 409
+    for index in range(4):
+        server.update_row(current, index, status='done', frame_count=15)
+    server.update_row(base, 0, status='done', frame_count=20)
+    response = client.post(path, json={'verdict': 'missing', 'note': '  =蓝牙弹窗未保留  '})
+    assert response.status_code == 200
+    annotation = response.json()['annotation']
+    assert annotation['note'] == '=蓝牙弹窗未保留' and annotation['updated_at'].endswith('+08:00')
+    assert client.post(f'/api/runs/{current}/items/1/annotation', json={'verdict': 'no_missing'}).status_code == 200
+    assert client.post(f'/api/runs/{current}/items/2/annotation', json={'verdict': None, 'note': '待核对'}).status_code == 200
+    assert client.post(path, json={'verdict': 'invalid'}).status_code == 422
+    assert client.post(f'/api/runs/{current}/items/-1/annotation', json={'verdict': 'missing'}).status_code == 404
+    server.update_row(current, 0, message='清理完成')
+    saved = client.get(f'/api/runs/{current}').json()['rows'][0]
+    assert saved['annotation'] == annotation and saved['frame_count'] == 15 and saved['message'] == '清理完成'
+    assert 'annotation' not in client.get(f'/api/runs/{base}').json()['rows'][0]
+
+    workbook = load_workbook(io.BytesIO(client.get(f'/api/runs/{current}/export.xlsx').content))
+    samples = workbook['样本统计']
+    headings, *rows = list(samples.values)
+    verdict_column = headings.index('人工判断')
+    assert [row[verdict_column] for row in rows] == ['发现关键帧遗漏', '未发现关键帧遗漏', '未标注', '未标注']
+    note = samples.cell(2, headings.index('标注备注') + 1)
+    assert (note.value, note.data_type) == (annotation['note'], 's')
+    assert rows[0][headings.index('标注更新时间')] == annotation['updated_at']
+    assert rows[2][headings.index('标注备注')] == '待核对'
+    summary = dict(workbook['批次概览'].values)
+    assert summary['已作人工判断样本数'] == 2
+    assert summary['人工判断·发现关键帧遗漏样本数'] == 1
+    assert summary['人工判断·未发现关键帧遗漏样本数'] == 1
+
+    copied = client.post(f'/api/runs/{current}/copy').json()
+    assert all('annotation' not in row for row in copied['rows'])
+    assert client.post(path, json={'verdict': None}).json() == {'annotation': None}
+    assert 'annotation' not in server.read_run(current)['rows'][0]
+    assert server.read_run(current)['rows'][1]['annotation']['verdict'] == 'no_missing'
+
+
 @pytest.mark.parametrize('field,value', [('experiment_max_frames', 1), ('experiment_max_frames', 2.5),
     ('experiment_max_frames', True), ('experiment_max_frames', None), ('experiment_max_frames', '20'),
     ('experiment_sample_fps', 0), ('experiment_sample_fps', -1), ('experiment_sample_fps', True),

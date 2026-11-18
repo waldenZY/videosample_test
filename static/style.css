@@ -6,3 +6,8 @@
 #startOptions label{display:inline-flex;flex-direction:column;vertical-align:top;gap:6px;margin:8px 14px 8px 0}#startOptions small{max-width:280px;color:var(--muted);font-size:11px}#frameLimit,#sampleFps{width:140px}
 
 button.danger{color:#a34332;border-color:#d7b0a6}button.danger:hover{background:#fff0eb}#retainVideo{width:auto}
+.annotation-form{display:grid;gap:8px;max-width:580px;margin:12px 0;padding:12px;border:1px solid var(--line);border-radius:8px}
+.annotation-form label{display:grid;gap:4px}
+.annotation-form textarea{font:inherit;resize:vertical;padding:8px;border:1px solid var(--line);border-radius:5px}
+.annotation-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.task-cell .status{margin-top:6px}

@@ -226,6 +226,32 @@ def get_run(identity: str):
     return run
 
 
+class AnnotationRequest(BaseModel):
+    verdict: Literal['missing', 'no_missing'] | None
+    note: str = Field(default='', max_length=2000)
+
+
+@app.post('/api/runs/{identity}/items/{index}/annotation')
+def save_annotation(identity: str, index: int, request: AnnotationRequest):
+    with LOCK:
+        run = read_run(identity)
+        if not 0 <= index < len(run['rows']):
+            raise HTTPException(404, '样本不存在')
+        row = run['rows'][index]
+        if row['status'] != 'done':
+            raise HTTPException(409, '样本抽帧完成后可标注')
+        note = request.note.strip()
+        annotation = None
+        if request.verdict is not None or note:
+            annotation = {'verdict': request.verdict, 'note': note,
+                          'updated_at': datetime.now(LOCAL_TIME).isoformat(timespec='seconds')}
+            row['annotation'] = annotation
+        else:
+            row.pop('annotation', None)
+        save_run(run)
+    return {'annotation': annotation}
+
+
 def related_runs(run):
     """Read and validate a whole batch, including a request made via its child."""
     root = read_run(run.get('group_id', run['id']))

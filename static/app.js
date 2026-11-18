@@ -2,20 +2,70 @@ const $=id=>document.getElementById(id);
 const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const labels={imported:'待开始',running:'运行中',done:'已结束',interrupted:'已中断',ready:'待开始',queued:'排队中',skipped:'未勾选',error:'失败'};
 const scoringNames={content_weight:'新增权重（旧版）',new_content_ratio:'新增比例（默认）'};
+const annotationLabels={missing:'发现关键帧遗漏',no_missing:'未发现关键帧遗漏'};
 const oldStageTitles={collected:'最初收集',timestamps:'合并相近时刻',range:'确定任务范围',states:'合并重复页面',endpoints:'保留任务首尾',budget:'控制图片数量',final:'最终结果'};
 function chainStages(run){const found=new Map();for(const row of run.rows){for(const stage of row.stages||Object.keys(row.stage_counts||{}).map(id=>({id,title:oldStageTitles[id]||id})))if(!found.has(stage.id))found.set(stage.id,stage);}return [...found.values()];}
 function closeSample(){
  detailToken++;$('sample').hidden=true;
+ annotationEditor=null;
  if($('frameDialog').open)$('frameDialog').close();
  $('sampleParking').append($('sample'));currentIndex=null;traceData=null;
 }
 let current=null, traceData=null, currentIndex=null, stageId='final', chosenFrame=null;
 let selected=new Set(), timer=null, loading=false, detailToken=0;
+let annotationEditor=null, annotationRevision=0;
 async function api(url,options={}){const r=await fetch(url,options);if(!r.ok){let e;try{e=await r.json()}catch{e={detail:r.statusText}}throw Error(typeof e.detail==='string'?e.detail:JSON.stringify(e.detail))}return r.json()}
 function notice(text,error=false){$('notice').hidden=!text;$('notice').textContent=text;$('notice').className=error?'error':''}
 function post(url,data={}){return api(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)})}
 function configLabel(run){const config={...(run.algorithm?.defaults||{}),...(run.algorithm?.overrides||{})};return `${run.algorithm?.key==='base'?'base 原始方法':scoringNames[config.selection_scoring]||'评分未记录'} · ${run.algorithm?.key==='base'?'数量目标':'最多'} ${config.max_frames??'未记录'} 张 · ${config.sample_fps??'未记录'} 帧/秒`;}
 function rowName(row){return row.item.id||`样本 ${row.index+1}`}
+function annotationBadge(row){
+ const verdict=row.annotation?.verdict;
+ const label=annotationLabels[verdict]||(row.annotation?.note?'有标注备注':'');
+ return label?`<div class="status ${verdict==='missing'?'error':verdict==='no_missing'?'done':''}">${esc(label)}</div>`:'';
+}
+function renderAnnotation(row){
+ $('annotationForm').hidden=row.status!=='done';
+ if(row.status!=='done')return;
+ if(annotationEditor?.id!==current.id||annotationEditor?.index!==row.index){
+  annotationEditor={id:current.id,index:row.index,dirty:false,saving:false,message:''};
+ }
+ const editor=annotationEditor;
+ if(!editor.dirty&&!editor.saving){
+  const verdict=row.annotation?.verdict??'', note=row.annotation?.note??'';
+  if($('annotationVerdict').value!==verdict)$('annotationVerdict').value=verdict;
+  if($('annotationNote').value!==note)$('annotationNote').value=note;
+ }
+ for(const id of ['annotationVerdict','annotationNote','saveAnnotation'])$(id).disabled=editor.saving;
+ $('clearAnnotation').disabled=editor.saving||(!row.annotation&&!editor.dirty);
+ $('annotationStatus').textContent=editor.message||(row.annotation?'已保存':'');
+}
+function editAnnotation(){
+ const editor=annotationEditor;
+ if(!editor)return;
+ editor.dirty=true;
+ editor.message='尚未保存';
+ renderAnnotation(current.rows[editor.index]);
+}
+async function saveAnnotation(verdict,note){
+ const editor=annotationEditor;
+ if(!editor||editor.saving)return;
+ editor.saving=true;
+ editor.message='正在保存…';
+ renderAnnotation(current.rows[editor.index]);
+ try{
+  const {annotation}=await post(`/api/runs/${editor.id}/items/${editor.index}/annotation`,{verdict,note});
+  annotationRevision++;
+  if(current?.id===editor.id)current.rows[editor.index].annotation=annotation;
+  editor.dirty=false;
+  editor.message=annotation?'已保存':'已清空';
+ }catch(error){
+  editor.message=`保存失败：${error.message}`;
+ }finally{
+  editor.saving=false;
+  if(current?.id===editor.id)renderBatch();
+ }
+}
 function frameURL(id,thumb=false){return `/api/runs/${current.id}/items/${currentIndex}/frames/${encodeURIComponent(id)}${thumb?'?thumb=true':''}`}
 function frameById(id){return traceData.frames.find(f=>f.id===id)}
 function sourceLabel(source){if(source.startsWith('start'))return '任务开始画面';if(source.startsWith('protected'))return '开头 / 结尾保护采样';if(source.startsWith('scene'))return '发现画面变化';if(source.startsWith('terminal'))return '视频末尾画面';if(source==='task-end')return '指定任务结束画面';return '沿途采样'}
@@ -30,13 +80,22 @@ function renderBatch(){if(!current)return;renderChainTabs();renderChainStatistic
  const f=$('rowFilter').value;
  const rows=current.rows.filter(r=>f==='all'||(f==='error'?['error','interrupted'].includes(r.status):f==='running'?['running','queued'].includes(r.status):r.status===f));
  // 进度刷新会重建列表，先移出详情以保留图片、筛选与事件绑定。
+ const active=document.activeElement;
+ const annotationFocus=active&&$('annotationForm').contains(active)?active:null;
  $('sampleParking').append($('sample'));
  if(currentIndex!==null&&!rows.some(r=>r.index===currentIndex))closeSample();
- $('rows').innerHTML=rows.map(r=>`<tr class="clickable ${currentIndex===r.index?'expanded':''}" data-index="${r.index}"><td><input type="checkbox" data-check="${r.index}" ${selected.has(r.index)?'checked':''} ${imported?'':'disabled'} aria-label="选择 ${esc(rowName(r))}"></td><td class="task-cell"><button class="sample-toggle" aria-expanded="${currentIndex===r.index}" aria-controls="sample-detail-${r.index}" aria-label="${currentIndex===r.index?'收起':'展开'} ${esc(rowName(r))}"><span aria-hidden="true">${currentIndex===r.index?'▾':'▸'}</span> ${esc(rowName(r))}</button><small>${esc(r.item.query)}</small></td><td><span class="status ${r.status}">${labels[r.status]||esc(r.status)}</span><div class="muted small">${esc(r.message)}</div>${r.error?`<div class="error-text">${esc(r.error)}</div>`:''}${r.warnings?.length?`<div class="error-text">${esc(r.warnings.join('；'))}</div>`:''}</td>${stages.map(s=>`<td>${r.stage_counts?.[s.id]??'<span class="muted">—</span>'}</td>`).join('')}<td>${r.frame_count??'—'}</td><td>${r.elapsed_s===undefined?'—':r.elapsed_s+'s'}</td></tr><tr class="sample-detail-row" id="sample-detail-${r.index}" hidden><td colspan="${stages.length+5}"><div id="sample-slot-${r.index}"></div></td></tr>`).join('');
- if(currentIndex!==null&&!$('sample').hidden){renderTimings(current.rows[currentIndex]);$(`sample-slot-${currentIndex}`).append($('sample'));$(`sample-detail-${currentIndex}`).hidden=false;}
+ $('rows').innerHTML=rows.map(r=>`<tr class="clickable ${currentIndex===r.index?'expanded':''}" data-index="${r.index}"><td><input type="checkbox" data-check="${r.index}" ${selected.has(r.index)?'checked':''} ${imported?'':'disabled'} aria-label="选择 ${esc(rowName(r))}"></td><td class="task-cell"><button class="sample-toggle" aria-expanded="${currentIndex===r.index}" aria-controls="sample-detail-${r.index}" aria-label="${currentIndex===r.index?'收起':'展开'} ${esc(rowName(r))}"><span aria-hidden="true">${currentIndex===r.index?'▾':'▸'}</span> ${esc(rowName(r))}</button><small>${esc(r.item.query)}</small>${annotationBadge(r)}</td><td><span class="status ${r.status}">${labels[r.status]||esc(r.status)}</span><div class="muted small">${esc(r.message)}</div>${r.error?`<div class="error-text">${esc(r.error)}</div>`:''}${r.warnings?.length?`<div class="error-text">${esc(r.warnings.join('；'))}</div>`:''}</td>${stages.map(s=>`<td>${r.stage_counts?.[s.id]??'<span class="muted">—</span>'}</td>`).join('')}<td>${r.frame_count??'—'}</td><td>${r.elapsed_s===undefined?'—':r.elapsed_s+'s'}</td></tr><tr class="sample-detail-row" id="sample-detail-${r.index}" hidden><td colspan="${stages.length+5}"><div id="sample-slot-${r.index}"></div></td></tr>`).join('');
+ if(currentIndex!==null&&!$('sample').hidden){
+  const row=current.rows[currentIndex];
+  renderTimings(row);
+  renderAnnotation(row);
+  $(`sample-slot-${currentIndex}`).append($('sample'));
+  $(`sample-detail-${currentIndex}`).hidden=false;
+  annotationFocus?.focus({preventScroll:true});
+ }
  $('selectAll').disabled=!imported;$('selectAll').checked=!!current.rows.length&&selected.size===current.rows.length;
 }
-function poll(){clearTimeout(timer);if(current&&(current.status==='running'||current.chains?.some(c=>c.status==='running')))timer=setTimeout(async()=>{try{const id=current.id;const updated=await api(`/api/runs/${id}`);if(current?.id!==id)return;current=updated;renderBatch();if(current.status!=='running'&&!current.chains?.some(c=>c.status==='running'))await refreshRuns();poll()}catch(e){notice(e.message,true);timer=setTimeout(poll,2500)}},1500)}
+function poll(){clearTimeout(timer);if(current&&(current.status==='running'||current.chains?.some(c=>c.status==='running')))timer=setTimeout(async()=>{try{const id=current.id,revision=annotationRevision;const updated=await api(`/api/runs/${id}`);if(current?.id!==id)return;if(revision!==annotationRevision){poll();return;}current=updated;renderBatch();if(current.status!=='running'&&!current.chains?.some(c=>c.status==='running'))await refreshRuns();poll()}catch(e){notice(e.message,true);timer=setTimeout(poll,2500)}},1500)}
 async function openSample(index){if(currentIndex===index&&!$('sample').hidden){closeSample();renderBatch();return;}closeSample();const token=++detailToken;currentIndex=index;const row=current.rows[index];$('sample').hidden=false;$('sampleTitle').textContent=`${rowName(row)} · ${current.algorithm?.key==='base'?'base 固定链路':'实验链路'}`;$('sampleQuery').textContent=row.item.query;setOriginalVideo(row);$('sampleInfo').textContent='正在读取过程结果…';$('gallery').innerHTML='';$('stages').innerHTML='';renderBatch();if(['ready','queued','skipped'].includes(row.status)&&!row.stages?.length){$('sampleInfo').textContent='尚无抽帧结果，可直接打开原视频。';return;}
  try{const data=await api(`/api/runs/${current.id}/items/${index}/trace`);if(token!==detailToken)return;traceData=data;stageId=data.stages.at(-1)?.id||'collected';$('frameFilter').value='kept';$('sampleInfo').textContent=`${current.version} · ${row.duration?.toFixed(2)||'—'} 秒视频 · ${configLabel({algorithm:{key:current.algorithm?.key,defaults:row.effective_config||{...current.algorithm?.defaults,...current.algorithm?.overrides}}})} · ${data.frames.length} 张候选图 · 最终 ${row.frame_count??'尚未完成'} 张${row.error?' · '+row.error:''}`;renderStages();renderGallery()}catch(e){if(token===detailToken)$('sampleInfo').textContent=row.error||e.message}}
 function renderTimings(row){
@@ -87,6 +146,13 @@ $('stages').onclick=e=>{const button=e.target.closest('[data-stage]');if(button)
 $('gallery').onclick=e=>{const button=e.target.closest('[data-frame]');if(button)openFrame(button.dataset.frame)};
 $('history').onclick=e=>{const button=e.target.closest('[data-peer]');if(button)openFrame(button.dataset.peer)};
 $('closeDialog').onclick=()=>$('frameDialog').close();$('closeSample').onclick=()=>{closeSample();renderBatch()};
+$('annotationVerdict').onchange=editAnnotation;
+$('annotationNote').oninput=editAnnotation;
+$('annotationForm').onsubmit=event=>{
+ event.preventDefault();
+ return saveAnnotation($('annotationVerdict').value||null,$('annotationNote').value);
+};
+$('clearAnnotation').onclick=()=>saveAnnotation(null,'');
 function setOriginalVideo(row){const source=String(row.item.video_path||'').trim();$('videoLink').href=/^https?:\/\//i.test(source)?source:`/api/runs/${current.id}/items/${row.index}/video`;}
 $('refreshRuns').onclick=()=>refreshRuns().catch(e=>notice(e.message,true));
 const selectionLabels={covered:'已识别的内容已覆盖',no_reliable_addition:'剩余候选没有可靠新增内容',limit_reached:'达到张数上限，仍有内容未覆盖'};

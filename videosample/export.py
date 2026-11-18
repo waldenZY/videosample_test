@@ -13,6 +13,7 @@ from openpyxl.utils import get_column_letter
 STATUS = {'done': '已完成', 'error': '失败', 'interrupted': '已中断', 'running': '运行中',
           'queued': '排队中', 'ready': '待开始', 'skipped': '未勾选', 'imported': '待开始'}
 REASONS = {'covered': '已识别内容已覆盖', 'no_reliable_addition': '无可靠新增', 'limit_reached': '达到上限仍未覆盖'}
+ANNOTATIONS = {'missing': '发现关键帧遗漏', 'no_missing': '未发现关键帧遗漏'}
 PHASES = {'video_prepare': '视频准备及下载等待', 'probe': '读取视频信息', 'fingerprint': '视频指纹核对', 'extraction': '抽帧合计'}
 STAGES = {'collected': '取图与候选准备', 'timestamps': '合并近时刻', 'range': '任务范围', 'states': '页面筛选',
           'endpoints': '首尾处理', 'content': '内容合并', 'review': '历史复核', 'local': '局部分析',
@@ -104,6 +105,10 @@ def workbook_bytes(run, directory: Path, statistics, exported_at):
         append(overview, [label, statistics.get(key)])
     append(overview, ['保留下载视频', run.get('retain_downloaded_video', True)])
     append(overview, ['待开始/等待/运行样本数', sum(r.get('status') in {'ready', 'queued', 'running'} for r in run.get('rows', []))])
+    verdicts = [at(row, 'annotation.verdict') for row in run.get('rows', [])]
+    append(overview, ['已作人工判断样本数', sum(verdict in ANNOTATIONS for verdict in verdicts)])
+    for verdict, label in ANNOTATIONS.items():
+        append(overview, [f'人工判断·{label}样本数', verdicts.count(verdict)])
     for key, label in [('sample_time_s', '每题总耗时（秒）'), ('extraction_time_s', '抽帧耗时（秒）'),
                        ('initial_frames', '初始候选张数'), ('final_frames', '最终输出张数')]:
         for sub, name in [('samples', '有效样本数'), ('mean', '平均'), ('total', '合计')]:
@@ -146,9 +151,11 @@ def workbook_bytes(run, directory: Path, statistics, exported_at):
                 'hit': selection.get('stop_reason') == 'limit_reached' if selection.get('stop_reason') in REASONS else None,
                 'images': str((item_dir / 'final').resolve()) if row.get('status') == 'done' and (item_dir / 'final').is_dir() else ('未完成' if not stable else '未找到最终目录'),
                 'status': STATUS.get(row.get('status'), row.get('status')), 'number': row['index'] + 1,
+                'annotation_label': ANNOTATIONS.get(at(row, 'annotation.verdict'), '未标注'),
                 'scoring': 'base 原始方法' if algorithm.get('key') == 'base' else effective.get('selection_scoring')}
         rows.append(data)
     columns = [('有效样本序号', 'number'), ('样本编号', 'row.item.id'), ('题目', 'row.item.query'), ('状态', 'status'),
+               ('人工判断', 'annotation_label'), ('标注备注', 'row.annotation.note'), ('标注更新时间', 'row.annotation.updated_at'),
                ('错误', 'row.error'), ('视频路径', 'row.item.video_path'), ('视频时长（秒）', 'row.duration'),
                ('下载副本清理提醒', 'row.download_cleanup_error'),
                ('指定开始（秒）', 'row.item.task_start_time'), ('指定结束（秒）', 'row.item.task_end_time'),
